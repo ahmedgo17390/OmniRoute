@@ -10,13 +10,36 @@ test("macOS development loads TypeScript configuration without spawning the CLI"
     const { default: config } = await import("../../next.config.mjs");
     if (process.platform === "darwin") {
       assert.equal(config.experimental.useTypeScriptCli, false);
+      assert.equal(config.experimental.workerThreads, true);
       const loadJsConfig = require("next/dist/build/load-jsconfig.js").default;
       const result = await loadJsConfig(process.cwd(), config);
       assert.deepEqual(result.jsConfig.compilerOptions.paths["@/*"], ["./src/*"]);
     } else {
       assert.equal(config.experimental.useTypeScriptCli, undefined);
+      assert.equal(config.experimental.workerThreads, undefined);
     }
   } finally {
+    if (previousNodeEnv === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = previousNodeEnv;
+  }
+});
+
+test("worker thread workaround is limited to macOS development", async () => {
+  const previousNodeEnv = process.env.NODE_ENV;
+  const platform = Object.getOwnPropertyDescriptor(process, "platform");
+  try {
+    for (const [os, nodeEnv, expected] of [
+      ["darwin", "development", true],
+      ["darwin", "production", undefined],
+      ["linux", "development", undefined],
+    ]) {
+      Object.defineProperty(process, "platform", { value: os, configurable: true });
+      process.env.NODE_ENV = nodeEnv;
+      const { default: config } = await import(`../../next.config.mjs?test=${os}-${nodeEnv}`);
+      assert.equal(config.experimental.workerThreads, expected);
+    }
+  } finally {
+    Object.defineProperty(process, "platform", platform);
     if (previousNodeEnv === undefined) delete process.env.NODE_ENV;
     else process.env.NODE_ENV = previousNodeEnv;
   }
