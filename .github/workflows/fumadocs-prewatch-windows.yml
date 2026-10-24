@@ -18,15 +18,33 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 20
     env:
-      DATA_DIR: ${{ runner.temp }}/omniroute-fumadocs-prewatch-data
       DISABLE_SQLITE_AUTO_BACKUP: "true"
       NEXT_TELEMETRY_DISABLED: "1"
       OMNIROUTE_SKIP_SYSTEM_TRUST: "1"
-      npm_config_cache: ${{ runner.temp }}/omniroute-fumadocs-prewatch-npm-cache
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+      - name: Initialize isolated runner paths
+        shell: pwsh
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP "omniroute-fumadocs-prewatch-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          $home = Join-Path $root "home"
+          $data = Join-Path $root "data"
+          $cache = Join-Path $root "npm-cache"
+          $npmrc = Join-Path $root "npmrc"
+
+          foreach ($path in @($home, $data, $cache)) {
+            New-Item -ItemType Directory -Force -Path $path | Out-Null
+          }
+
+          @(
+            "HOME=$home"
+            "USERPROFILE=$home"
+            "DATA_DIR=$data"
+            "npm_config_cache=$cache"
+            "npm_config_userconfig=$npmrc"
+          ) | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 24.22.1
