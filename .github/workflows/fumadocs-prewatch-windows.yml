@@ -29,18 +29,18 @@ jobs:
         shell: pwsh
         run: |
           $root = Join-Path $env:RUNNER_TEMP "omniroute-fumadocs-prewatch-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
-          $home = Join-Path $root "home"
+          $privateHome = Join-Path $root "home"
           $data = Join-Path $root "data"
           $cache = Join-Path $root "npm-cache"
           $npmrc = Join-Path $root "npmrc"
 
-          foreach ($path in @($home, $data, $cache)) {
+          foreach ($path in @($privateHome, $data, $cache)) {
             New-Item -ItemType Directory -Force -Path $path | Out-Null
           }
 
           @(
-            "HOME=$home"
-            "USERPROFILE=$home"
+            "HOME=$privateHome"
+            "USERPROFILE=$privateHome"
             "DATA_DIR=$data"
             "npm_config_cache=$cache"
             "npm_config_userconfig=$npmrc"
