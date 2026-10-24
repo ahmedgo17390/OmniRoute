@@ -111,9 +111,24 @@ jobs:
             throw "Focused test failed with exit code $exitCode."
           }
 
-          $summary = $output | Out-String
-          foreach ($expected in @("# pass 15", "# fail 0", "# skipped 0")) {
-            if (-not $summary.Contains($expected)) {
-              throw "Focused test did not report '$expected'."
+          $summaryLines = ($output | Out-String) -split "\r?\n"
+          $expectedCounts = [ordered]@{
+            tests = 15
+            pass = 15
+            fail = 0
+            skipped = 0
+          }
+
+          foreach ($fieldName in $expectedCounts.Keys) {
+            $fieldPattern = "^\s*(?:#|ℹ)\s*$fieldName\s+(\d+)\s*$"
+            $fieldLines = @($summaryLines | Where-Object { $_ -match $fieldPattern })
+            if ($fieldLines.Count -ne 1) {
+              throw "Focused test must report exactly one '$fieldName' summary line."
+            }
+
+            $null = $fieldLines[0] -match $fieldPattern
+            $actualCount = [int]$Matches[1]
+            if ($actualCount -ne $expectedCounts[$fieldName]) {
+              throw "Focused test reported $fieldName=$actualCount; expected $($expectedCounts[$fieldName])."
             }
           }
