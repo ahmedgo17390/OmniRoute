@@ -1,0 +1,55 @@
+diff --git a/node_modules/fumadocs-mdx/dist/next/index.js b/node_modules/fumadocs-mdx/dist/next/index.js
+--- a/node_modules/fumadocs-mdx/dist/next/index.js
++++ b/node_modules/fumadocs-mdx/dist/next/index.js
+@@ -13,4 +13,7 @@ const defaultPageExtensions = [
+ 	"tsx",
+ 	"ts"
+ ];
++function toArray(value) {
++	return value === void 0 ? [] : Array.isArray(value) ? value : [value];
++}
+ function createMDX(options = {}) {
+@@ -20,7 +23,7 @@ function createMDX(options = {}) {
+ 	let pending;
+ 	if (process.env._FUMADOCS_MDX !== "1") {
+ 		process.env._FUMADOCS_MDX = "1";
+-		pending = init(isDev, core);
++		pending = init(isDev, core, options.watcher);
+ 		pending.catch((err) => {
+ 			console.error("[MDX] failed to generate files:", err);
+ 		});
+@@ -126,7 +129,7 @@ function createMDX(options = {}) {
+ 		});
+ 	};
+ }
+-function init(dev, core) {
++function init(dev, core, watcherOptions) {
+ 	async function initOrReload() {
+ 		const { config, fromFile } = await loadConfig(core, true);
+ 		await core.init({ config });
+@@ -137,5 +140,5 @@ function init(dev, core, watcherOptions) {
+ 		const watcher = new FSWatcher({
+ 			ignoreInitial: true,
+ 			persistent: true,
+-			ignored: [core.outDir]
++			ignored: [core.outDir, ...toArray(watcherOptions?.ignored)]
+ 		});
+diff --git a/node_modules/fumadocs-mdx/dist/next/index.d.ts b/node_modules/fumadocs-mdx/dist/next/index.d.ts
+--- a/node_modules/fumadocs-mdx/dist/next/index.d.ts
++++ b/node_modules/fumadocs-mdx/dist/next/index.d.ts
+@@ -1,5 +1,6 @@
+ import { p as IndexFilePluginOptions, r as CoreOptions } from "../core-b6wXL1QY.js";
+ import { t as MacroPluginOption } from "../options-aB6xV-d7.js";
++import type { ChokidarOptions } from "chokidar";
+ import { NextConfig } from "next";
+ //#region src/next/index.d.ts
+ export interface CreateMDXOptions extends Pick<CoreOptions, 'configPath' | 'outDir'> {
+@@ -10,4 +11,8 @@ export interface CreateMDXOptions extends Pick<CoreOptions, 'configPath' | 'outD
+    */
+   macro?: MacroPluginOption;
+   index?: IndexFilePluginOptions | false;
++  /**
++   * Files or directories excluded from Fumadocs' development watcher.
++   */
++  watcher?: Pick<ChokidarOptions, 'ignored'>;
+ }
