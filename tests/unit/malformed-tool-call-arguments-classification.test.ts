@@ -15,6 +15,8 @@ const { BaseExecutor, buildClaudeResponse, combosDb, getLatestCallLog, resetStor
   harness;
 const providersDb = await import("../../src/lib/db/providers.ts");
 const { getCircuitBreaker, STATE } = await import("../../src/shared/utils/circuitBreaker.ts");
+const { getAllModelLockouts } = await import("../../open-sse/services/accountFallback.ts");
+const { invalidateDbCache } = await import("../../src/lib/db/readCache.ts");
 const { translateNonStreamingResponse } =
   await import("../../open-sse/handlers/responseTranslator.ts");
 const { extractToolSchemaMap } =
@@ -144,6 +146,33 @@ async function seedOpenAI() {
     testStatus: "active",
   });
 }
+
+async function seedClaude() {
+  await providersDb.createProviderConnection({
+    provider: "claude",
+    authType: "apikey",
+    name: "claude-fallback",
+    apiKey: CLAUDE_KEY,
+    isActive: true,
+    testStatus: "active",
+  });
+}
+
+async function createFallbackCombo(name: string) {
+  await combosDb.createCombo({
+    name,
+    strategy: "priority",
+    config: { maxRetries: 0, retryDelayMs: 0 },
+    models: ["openai/o3-mini", "claude/claude-sonnet-4.6"],
+  });
+}
+
+const openAIModelLockouts = async () => {
+  const connectionId = (await openAIConnection()).id;
+  return getAllModelLockouts().filter(
+    (lock) => lock.provider === "openai" && lock.connectionId === connectionId
+  );
+};
 
 async function openAIConnection() {
   const [row] = (await providersDb.getProviderConnections({ provider: "openai" })) as Array<
@@ -363,4 +392,90 @@ test("a combo falls back past a malformed response without counting a provider f
   assert.equal(getCircuitBreaker("openai").failureCount, 0);
   assert.equal(getCircuitBreaker("openai").state, STATE.CLOSED);
   assert.equal((await openAIConnection()).testStatus, "active");
+});
+
+test("a combo leaves no model lockout behind for a malformed target", async () => {
+  await seedOpenAI();
+  await seedClaude();
+  await createFallbackCombo("malformed-tool-args-lockout-combo");
+  mockUpstream(() => "malformed");
+
+  for (let i = 0; i < 2; i++) {
+    const response = await postMessages("malformed-tool-args-lockout-combo", `lockout ${i}`);
+    assert.equal(response.status, 200);
+    await response.arrayBuffer();
+  }
+  assert.equal(calls.openai, 2, "the second request must try the malformed target again");
+  assert.deepEqual(await openAIModelLockouts(), []);
+});
+
+for (const [mode, status] of [
+  ["transport", 502],
+  ["outage", 503],
+] as const) {
+  test(`a combo still treats a genuine ${mode} failure as a provider failure`, async () => {
+    await seedOpenAI();
+    await seedClaude();
+    await createFallbackCombo(`genuine-${mode}-combo`);
+    mockUpstream(() => mode);
+
+    const first = await postMessages(`genuine-${mode}-combo`, "first");
+    const firstBody = (await first.json()) as { content?: Array<{ text?: string }> };
+    assert.equal(first.status, 200, `fallback must answer after the ${status}`);
+    assert.equal(firstBody.content?.[0]?.text, "fallback target answered");
+    assert.ok(calls.openai >= 1);
+    assert.equal(getCircuitBreaker("openai").failureCount, 1);
+    const connection = await openAIConnection();
+    assert.equal(connection.testStatus, "unavailable");
+    assert.ok(connection.rateLimitedUntil, "a genuine failure keeps its cooldown");
+
+    // The cooled target is skipped on the next request, as before.
+    const openAICallsBefore = calls.openai;
+    const second = await postMessages(`genuine-${mode}-combo`, "second");
+    assert.equal(second.status, 200);
+    await second.arrayBuffer();
+    assert.equal(calls.openai, openAICallsBefore);
+  });
+}
+
+// ── Breaker HALF_OPEN probe ─────────────────────────────────────────────────
+
+test("a malformed response to a HALF_OPEN probe neither reopens the breaker nor counts", async () => {
+  const resetTimeoutMs = 1000; // the breaker's minimum reset window
+  await settingsDb.updateSettings({
+    resilienceSettings: {
+      providerBreaker: {
+        apikey: { failureThreshold: FAILURE_THRESHOLD, degradationThreshold: 2, resetTimeoutMs },
+      },
+    },
+  });
+  invalidateDbCache();
+  await seedOpenAI();
+  let mode: UpstreamMode = "malformed";
+  mockUpstream(() => mode);
+
+  // Prime the breaker's options from the request path, then open it.
+  const warmup = await postMessages("openai/o3-mini", "warm up");
+  assert.equal(warmup.status, 502);
+  await warmup.arrayBuffer();
+  const breaker = getCircuitBreaker("openai");
+  for (let i = 0; i < FAILURE_THRESHOLD; i++) breaker._onFailure();
+  assert.equal(breaker.state, STATE.OPEN);
+  const failuresWhenOpened = breaker.failureCount;
+  await new Promise((resolve) => setTimeout(resolve, resetTimeoutMs + 50));
+
+  const probe = await postMessages("openai/o3-mini", "probe");
+  await probe.arrayBuffer();
+  assert.equal(probe.status, 502, "the probe reached the provider and got a malformed reply");
+  assert.equal(calls.openai, 2);
+  assert.notEqual(breaker.state, STATE.OPEN, "a malformed probe reply must not reopen the breaker");
+  assert.equal(breaker.failureCount, failuresWhenOpened);
+
+  // Once the probe window lapses, a valid probe closes the breaker.
+  mode = "valid";
+  await new Promise((resolve) => setTimeout(resolve, resetTimeoutMs + 50));
+  const healthy = await postMessages("openai/o3-mini", "healthy probe");
+  await healthy.arrayBuffer();
+  assert.equal(healthy.status, 200);
+  assert.equal(breaker.state, STATE.CLOSED);
 });
