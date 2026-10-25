@@ -117,6 +117,8 @@ env:
   # Shared bounded runner with process/socket/output sampling (sourced by both jobs).
   RUN_LIB: |
     BASE_IMPORTS="--import tsx/esm --import ./open-sse/utils/setupPolyfill.ts --import ./tests/_setup/isolateDataDir.ts"
+    # Steps run under `bash -e`; timeouts (124) and test failures are expected outcomes here.
+    set +e
     sample() {
       local d=$1 root=$2
       while kill -0 "$root" 2>/dev/null; do
@@ -139,7 +141,7 @@ env:
       env ${envv[@]+"${envv[@]}"} timeout -k 15 "$lim" node ${pre[@]+"${pre[@]}"} $BASE_IMPORTS --test --test-reporter=tap "$@" > "$d/out.tap" 2> "$d/err.txt" < /dev/null &
       local tp=$!
       sample "$d" "$tp" & local sp=$!
-      wait "$tp"; local rc=$?
+      local rc=0; wait "$tp" || rc=$?
       kill "$sp" 2>/dev/null; wait "$sp" 2>/dev/null
       printf '%s\t%s\t%s\n' "$name" "$rc" "$(( $(date +%s) - t0 ))" | tee -a out/manifest.tsv
     }
