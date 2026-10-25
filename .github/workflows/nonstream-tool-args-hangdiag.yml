@@ -1,0 +1,274 @@
+# TEMPORARY Phase A hang diagnostic. Lives only on test/nonstream-tool-args-linux-20261025.
+# Gate 3R (run 40182562808) shards 1, 2, 3 and 7 never terminated without --test-force-exit.
+# For each suspected file, on the frozen fix commit: does it complete normally, finish its tests
+# but keep the process alive (and with which handles), contain a test that never finishes, or
+# was it wrongly identified? Evidence: a plain bounded run, an instrumented run (workflow-only
+# --import preload that records open handles and still-active timers with their creation
+# site), process/socket sampling, and independent expected test-identity sets. A context job
+# runs each shard's leading interrupted files together, with and without the suspect.
+name: Nonstream Tool Args Phase A Hang Diagnostic
+
+on:
+  push:
+    branches: [test/nonstream-tool-args-linux-20261025]
+
+concurrency:
+  group: nonstream-tool-args-hangdiag-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  FIX_SHA: 8fd2e261e2a069c637d9f4383cbed8fddc036647
+  CI_NODE_MAJOR: "24"
+  DISABLE_SQLITE_AUTO_BACKUP: "true"
+  NEXT_TELEMETRY_DISABLED: "1"
+  OMNIROUTE_SKIP_SYSTEM_TRUST: "1"
+  # Same literal test values as ci.yml test-unit (not repository secrets).
+  JWT_SECRET: ci-test-secret-with-sufficient-length-for-validation
+  API_KEY_SECRET: ci-test-api-key-secret-long
+  NODE_OPTIONS: --max-old-space-size=8192
+  # Instrumentation preload (loaded only by this diagnostic). In a test child process
+  # (NODE_TEST_CONTEXT set by the runner) it records, every 10 s and at exit: active
+  # resource types, active handles with endpoints/targets, and still-referenced timers
+  # (setInterval, and setTimeout >= 1 s) with the call site that created them.
+  HANDLES_PRELOAD: |
+    import { appendFileSync, mkdirSync } from "node:fs";
+    const dir = process.env.HANGDIAG_DIR;
+    if (dir) {
+      mkdirSync(dir, { recursive: true });
+      const testFile = process.argv.slice(1).find((a) => /\.test\.(ts|mjs|js)$/.test(a)) ?? "";
+      const role = process.env.NODE_TEST_CONTEXT ? `child:${testFile.replace(/^.*?(tests\/unit\/)/, "$1")}` : "runner";
+      const timers = new Map();
+      const site = () => (new Error().stack ?? "").split("\n").slice(2).map((s) => s.trim())
+        .filter((s) => !s.includes("node:internal") && !s.includes("hangdiag-preload")).slice(0, 4).join(" <- ");
+      const keep = (wrapper, orig) => { for (const k of Reflect.ownKeys(orig)) { if (!(k in wrapper) || typeof k === "symbol") { try { Object.defineProperty(wrapper, k, Object.getOwnPropertyDescriptor(orig, k)); } catch {} } } return wrapper; };
+      const oSI = globalThis.setInterval, oST = globalThis.setTimeout, oCI = globalThis.clearInterval, oCT = globalThis.clearTimeout;
+      globalThis.setInterval = keep(function setInterval(fn, ms, ...a) { const t = oSI(fn, ms, ...a); timers.set(t, { kind: "interval", ms, site: site() }); return t; }, oSI);
+      globalThis.setTimeout = keep(function setTimeout(fn, ms, ...a) {
+        let t; const run = typeof fn === "function" ? function (...x) { timers.delete(t); return fn.apply(this, x); } : fn;
+        t = oST(run, ms, ...a); if ((ms ?? 0) >= 1000) timers.set(t, { kind: "timeout", ms, site: site() }); return t;
+      }, oST);
+      globalThis.clearInterval = keep(function clearInterval(t) { timers.delete(t); return oCI(t); }, oCI);
+      globalThis.clearTimeout = keep(function clearTimeout(t) { timers.delete(t); return oCT(t); }, oCT);
+      const describe = (h) => {
+        const type = h?.constructor?.name ?? typeof h; const d = { type };
+        try {
+          if (type === "Socket" || type === "TLSSocket") Object.assign(d, { remote: `${h.remoteAddress ?? h._host ?? "?"}:${h.remotePort ?? "?"}`, local: h.localPort, connecting: h.connecting, destroyed: h.destroyed, fd: h._handle?.fd });
+          else if (type === "Server") d.address = h.address?.();
+          else if (type === "ChildProcess") Object.assign(d, { pid: h.pid, file: h.spawnfile, args: (h.spawnargs ?? []).slice(1, 6) });
+        } catch {}
+        return d;
+      };
+      const dump = (why) => { try { appendFileSync(`${dir}/${process.pid}.jsonl`, JSON.stringify({ t: Date.now(), why, pid: process.pid, ppid: process.ppid, role,
+        resources: process.getActiveResourcesInfo(), handles: process._getActiveHandles().map(describe),
+        timers: [...timers.entries()].filter(([t]) => typeof t?.hasRef !== "function" || t.hasRef()).map(([, v]) => v) }) + "\n"); } catch {} };
+      oSI(() => dump("periodic"), 10000).unref();
+      process.on("exit", () => dump("exit"));
+      dump("start");
+    }
+  TAP_PARSER: |
+    import { readFileSync } from "node:fs";
+    const unesc = (s) => s.replace(/\\#/g, "#").replace(/\\\\/g, "\\");
+    export function parseTap(file) {
+      const lines = readFileSync(file, "utf8").split("\n");
+      const stack = [];
+      const tests = [];
+      const started = [];
+      const summary = {};
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        const sub = line.match(/^( *)# Subtest: (.*)$/);
+        if (sub) { const lvl = sub[1].length / 4; stack.length = lvl; stack[lvl] = unesc(sub[2]); started.push([...stack].join(" > ")); continue; }
+        const sm = line.match(/^# (tests|suites|pass|fail|cancelled|skipped|todo|duration_ms) ([\d.]+)$/);
+        if (sm) { summary[sm[1]] = Number(sm[2]); continue; }
+        const r = line.match(/^( *)(ok|not ok) \d+ - (.*?)(?: # (SKIP|TODO)\b.*)?$/);
+        if (!r) continue;
+        const lvl = r[1].length / 4;
+        const name = unesc(r[3]);
+        const meta = {};
+        if ((lines[i + 1] ?? "").trim() === "---") {
+          const pad = r[1] + "  ";
+          let j = i + 2;
+          for (; j < lines.length && lines[j] !== pad + "..."; j++) {
+            const kv = lines[j].match(/^ *(type|failureType|error|code): ?(.*)$/);
+            if (!kv || !lines[j].startsWith(pad) || lines[j].startsWith(pad + " ")) continue;
+            let v = kv[2];
+            if (v === "|-" || v === "|" || v === ">-") {
+              const body = [];
+              while (j + 1 < lines.length && lines[j + 1].startsWith(pad + "  ")) body.push(lines[++j].trim());
+              v = body.join("\n");
+            } else v = v.replace(/^'(.*)'$/, "$1").replace(/''/g, "'");
+            meta[kv[1]] = v;
+          }
+          i = j;
+        }
+        const id = [...stack.slice(0, lvl), name].join(" > ");
+        const done = started.lastIndexOf(id); if (done >= 0) started.splice(done, 1);
+        if (meta.type === "suite") continue;
+        let status = r[2] === "ok" ? (r[4] ? r[4].toLowerCase() : "pass") : "fail";
+        if (status === "fail" && meta.failureType === "testTimeoutFailure") status = "timeout";
+        if (status === "fail" && meta.failureType === "cancelledByParent") status = "cancelled";
+        tests.push({ id, status, err: (meta.error ?? "").split("\n")[0].slice(0, 200) });
+      }
+      return { tests, summary: Object.keys(summary).length ? summary : null, unfinished: started };
+    }
+  # Shared bounded runner with process/socket/output sampling (sourced by both jobs).
+  RUN_LIB: |
+    BASE_IMPORTS="--import tsx/esm --import ./open-sse/utils/setupPolyfill.ts --import ./tests/_setup/isolateDataDir.ts"
+    sample() {
+      local d=$1 root=$2
+      while kill -0 "$root" 2>/dev/null; do
+        local pids
+        pids=$(ps -eo pid=,ppid= | awk -v r="$root" '{p[$1]=$2} END {a[r]=1; c=1; while (c) {c=0; for (k in p) if (!(k in a) && (p[k] in a)) {a[k]=1; c=1}} for (k in a) print k}' | tr '\n' ' ')
+        {
+          echo "=== t=$(date +%s) tap_lines=$(wc -l < "$d/out.tap") stderr_lines=$(wc -l < "$d/err.txt") ioredis_lines=$(grep -ac 'ioredis' "$d/err.txt")"
+          ps -o pid=,ppid=,etimes=,stat=,args= -p "$(echo $pids | tr ' ' ',')" 2>/dev/null | cut -c1-240
+          ss -tanpH 2>/dev/null | grep -E "pid=($(echo $pids | tr ' ' '|'))," | cut -c1-200 || true
+        } >> "$d/samples.txt"
+        sleep 10
+      done
+    }
+    run() { # name limit instrumented(0|1) runner-flags... -- files...
+      local name=$1 lim=$2 inst=$3; shift 3
+      local d="out/$name"; mkdir -p "$d"; : > "$d/out.tap"; : > "$d/err.txt"
+      local pre=() envv=()
+      if [ "$inst" = 1 ]; then pre=(--import "$RUNNER_TEMP/hangdiag-preload.mjs"); envv=("HANGDIAG_DIR=$PWD/$d/handles"); fi
+      local t0; t0=$(date +%s)
+      env ${envv[@]+"${envv[@]}"} timeout -k 15 "$lim" node ${pre[@]+"${pre[@]}"} $BASE_IMPORTS --test --test-reporter=tap "$@" > "$d/out.tap" 2> "$d/err.txt" < /dev/null &
+      local tp=$!
+      sample "$d" "$tp" & local sp=$!
+      wait "$tp"; local rc=$?
+      kill "$sp" 2>/dev/null; wait "$sp" 2>/dev/null
+      printf '%s\t%s\t%s\n' "$name" "$rc" "$(( $(date +%s) - t0 ))" | tee -a out/manifest.tsv
+    }
+
+jobs:
+  file:
+    name: Phase A file (${{ matrix.slug }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - slug: proxy-health-recovery-pass
+            file: tests/unit/proxy-health-recovery-pass.test.ts
+          - slug: daily-reset-tz-threading
+            file: tests/unit/daily-reset-tz-threading.test.ts
+          - slug: next-macos-typescript-config
+            file: tests/unit/next-macos-typescript-config.test.mjs
+          - slug: quota-redis-store
+            file: tests/unit/quota-redis-store.test.ts
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.FIX_SHA }}
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.CI_NODE_MAJOR }}
+          package-manager-cache: false
+      - uses: ./.github/actions/npm-ci-retry
+        with:
+          cache: "false"
+      - name: Gate 0 - toolchain and isolation
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$FIX_SHA"
+          test "${{ runner.environment }}" = "github-hosted"
+          node -v; npm -v
+          test "$(node -p 'process.versions.node.split(".")[0]')" = "$CI_NODE_MAJOR"
+          test "$(npm -v)" = "$(node -p "require('./config/ci/toolchain.json').npm")"
+          test -z "${DATA_DIR+x}" && test -z "${OMNIROUTE_ALLOW_DEFAULT_DATA_DIR+x}"
+          npm run check:node-runtime
+          mkdir -p out
+          { echo "node=$(node -v)"; echo "npm=$(npm -v)"; echo "sha=$(git rev-parse HEAD)"; echo "file=${{ matrix.file }}"; } > out/toolchain.txt
+      - name: Write helpers
+        run: |
+          printf '%s' "$HANDLES_PRELOAD" > "$RUNNER_TEMP/hangdiag-preload.mjs"
+          printf '%s' "$TAP_PARSER" > "$RUNNER_TEMP/tap.mjs"
+          printf '%s' "$RUN_LIB" > "$RUNNER_TEMP/runlib.sh"
+      - name: Runs (process isolation without force-exit, then expected-set references)
+        env:
+          F: ${{ matrix.file }}
+        run: |
+          set -u
+          source "$RUNNER_TEMP/runlib.sh"
+          # 1) plain, exactly as Gate 3R would run it (no force-exit), bounded
+          run plain 240 0 --test-concurrency=1 "$F"
+          # 2) the same, instrumented
+          run instrumented 240 1 --test-concurrency=1 "$F"
+          # 3) expected-set references: in-process + force-exit (lost no results in run
+          #    40178990614) and process isolation + force-exit (lossy; union only)
+          for i in 1 2 3; do run "inproc-force-$i" 180 0 --test-isolation=none --test-force-exit --test-concurrency=1 "$F"; done
+          for i in 1 2 3 4 5; do run "proc-force-$i" 180 0 --test-force-exit --test-concurrency=1 "$F"; done
+          cat out/manifest.tsv
+      - name: Upload Phase A file results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: hang-file-${{ matrix.slug }}
+          path: out/
+          if-no-files-found: error
+
+  context:
+    name: Phase A context (shard ${{ matrix.shard }} leading files)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - shard: 1
+            files: tests/unit/proxy-health-recovery-pass.test.ts tests/unit/proxy-logger-attribution.test.ts tests/unit/proxy-logs-route.test.ts tests/unit/proxy-operator-egress-route.test.ts tests/unit/proxy-pool-member-egress-route.test.ts tests/unit/proxy-probe-target.test.ts tests/unit/proxy-registry-route-handlers.test.ts tests/unit/proxy-scope-id-guard.test.ts
+          - shard: 2
+            files: tests/unit/daily-reset-tz-threading.test.ts tests/unit/dashboard-sidebar-desktop-visible.test.ts tests/unit/database-settings-maintenance.test.ts tests/unit/db-adapters/nodeSqliteShared.test.ts tests/unit/db-backup-autobackup-setting-5871.test.ts tests/unit/db-backup-tempdir-mkdtemp.test.ts tests/unit/db-cleanup-xp-audit-log.test.ts tests/unit/db-core-init.test.ts
+          - shard: 3
+            files: tests/unit/next-macos-typescript-config.test.mjs tests/unit/no-src-open-sse-alias.test.ts tests/unit/noauth-blocked-partition-5183.test.ts tests/unit/noauth-pause-visibility.test.ts tests/unit/non-streaming-client-translate.test.ts tests/unit/normalize-base-path.test.ts tests/unit/notrack-web-catalog-docs.test.ts tests/unit/numeric-helpers.test.ts
+          - shard: 7
+            files: tests/unit/quota-redis-store.test.ts tests/unit/quota-scoring-alias-lookup-10877.test.ts tests/unit/quota-signal-errortext-threading.test.ts tests/unit/quota-summed-budget.test.ts tests/unit/qwen-cloud-token-plan-media.test.ts tests/unit/qwen-token-plan-monthly-window-14763.test.ts tests/unit/radar-apply-feed.test.ts tests/unit/radar-feed-eligibility-gate.test.ts
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.FIX_SHA }}
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.CI_NODE_MAJOR }}
+          package-manager-cache: false
+      - uses: ./.github/actions/npm-ci-retry
+        with:
+          cache: "false"
+      - name: Gate 0 - toolchain and isolation
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$FIX_SHA"
+          test "${{ runner.environment }}" = "github-hosted"
+          test "$(node -p 'process.versions.node.split(".")[0]')" = "$CI_NODE_MAJOR"
+          test "$(npm -v)" = "$(node -p "require('./config/ci/toolchain.json').npm")"
+          test -z "${DATA_DIR+x}" && test -z "${OMNIROUTE_ALLOW_DEFAULT_DATA_DIR+x}"
+          mkdir -p out
+          { echo "node=$(node -v)"; echo "npm=$(npm -v)"; echo "sha=$(git rev-parse HEAD)"; echo "shard=${{ matrix.shard }}"; } > out/toolchain.txt
+      - name: Write helpers
+        run: |
+          printf '%s' "$HANDLES_PRELOAD" > "$RUNNER_TEMP/hangdiag-preload.mjs"
+          printf '%s' "$RUN_LIB" > "$RUNNER_TEMP/runlib.sh"
+      - name: Leading files together, with and without the suspect (no force-exit, instrumented)
+        env:
+          FILES: ${{ matrix.files }}
+        run: |
+          set -u
+          source "$RUNNER_TEMP/runlib.sh"
+          read -r -a all <<< "$FILES"
+          test "${#all[@]}" -eq 8
+          run with-suspect 300 1 --test-concurrency=4 "${all[@]}"
+          run without-suspect 300 1 --test-concurrency=4 "${all[@]:1}"
+      - name: Upload Phase A context results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: hang-context-shard-${{ matrix.shard }}
+          path: out/
+          if-no-files-found: error
