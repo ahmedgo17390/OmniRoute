@@ -1,0 +1,145 @@
+# TEMPORARY targeted recheck of the Vitest UI failures seen only on the candidate in run
+# 40211951530 (11 tests in 3 files, mostly 5000 ms timeouts; the candidate's UI run took 346 s
+# against 242 s on the base). None of the 7 changed production files is reachable from those
+# test files. Each side runs the three files 5 times on separate runners, plus one more full
+# Vitest UI run, and the per-identity outcomes are compared side by side.
+# Lives only on test/malformed-tool-args-linux-20261025.
+name: Malformed Tool Args Vitest UI Recheck
+
+on:
+  push:
+    branches: [test/malformed-tool-args-linux-20261025]
+
+concurrency:
+  group: malformed-tool-args-vitest-recheck-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CAND_SHA: 13fb425e90ba4022a21f6cf71170ecbab6336d6f
+  BASE_SHA: 81e48878b90fb309ede580bca8b97c6953a2fc62
+  CI_NODE_MAJOR: "24"
+  NEXT_TELEMETRY_DISABLED: "1"
+  OMNIROUTE_SKIP_SYSTEM_TRUST: "1"
+  JWT_SECRET: ci-test-secret-with-sufficient-length-for-validation
+  API_KEY_SECRET: ci-test-api-key-secret-long
+  CI_DIR: ci-temp/.github/ci-temp
+  RECHECK_FILES: >-
+    tests/unit/dashboard/modelsCombosCatalog.test.tsx
+    tests/unit/ui/api-key-routing-editor.test.tsx
+    tests/unit/ui/settings-cache-i18n.test.tsx
+
+jobs:
+  recheck:
+    name: Vitest UI ${{ matrix.run }} (${{ matrix.side }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        side: [candidate, base]
+        run: [files-1, files-2, files-3, files-4, files-5, full]
+    env:
+      SIDE: ${{ matrix.side }}
+      SUITE: ui-${{ matrix.run }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ matrix.side == 'candidate' && env.CAND_SHA || env.BASE_SHA }}
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: ci-temp
+          sparse-checkout: .github/ci-temp
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.CI_NODE_MAJOR }}
+          package-manager-cache: false
+      - uses: ./.github/actions/npm-ci-retry
+        with:
+          cache: "false"
+      - name: Gate 0 - toolchain and isolation
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${{ matrix.side == 'candidate' && env.CAND_SHA || env.BASE_SHA }}"
+          test "${{ runner.environment }}" = "github-hosted"
+          test "$(node -p 'process.versions.node.split(".")[0]')" = "$CI_NODE_MAJOR"
+          test "$(npm -v)" = "$(node -p "require('./config/ci/toolchain.json').npm")"
+          test -z "${DATA_DIR+x}" && test -z "${OMNIROUTE_ALLOW_DEFAULT_DATA_DIR+x}"
+          mkdir -p out
+          { echo "sha=$(git rev-parse HEAD)"; echo "side=$SIDE"; echo "run=${{ matrix.run }}"; nproc; } > out/toolchain.txt
+      - name: Run (same config as test:vitest:ui, bounded)
+        run: |
+          set +e
+          files=""
+          [ "${{ matrix.run }}" = full ] || files="$RECHECK_FILES"
+          start=$(date +%s)
+          timeout -k 30 1500 npx --no-install vitest run --config vitest.config.ts $files \
+            --reporter=default --reporter=junit --outputFile.junit=out/vitest.junit.xml > out/vitest.log 2>&1 < /dev/null
+          echo "VITEST_RC=$?" >> "$GITHUB_ENV"
+          echo "secs=$(( $(date +%s) - start ))" >> out/toolchain.txt
+          tail -8 out/vitest.log
+          exit 0
+      - name: Results
+        run: node "$CI_DIR/vitest-results.mjs" "$PWD/$CI_DIR/lib" "$VITEST_RC"
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: recheck-${{ matrix.side }}-${{ matrix.run }}
+          path: out/
+          if-no-files-found: error
+
+  summary:
+    name: Recheck summary
+    needs: recheck
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          path: results
+      - name: Per-identity outcomes across runs
+        run: |
+          node --input-type=module - <<'EOF'
+          import { existsSync, readFileSync, readdirSync, writeFileSync, appendFileSync } from "node:fs";
+          const BAD = new Set(["fail", "timeout", "cancelled"]);
+          const rows = [], problems = [], perId = new Map();
+          for (const side of ["candidate", "base"]) {
+            for (const run of ["files-1", "files-2", "files-3", "files-4", "files-5", "full"]) {
+              const p = `results/recheck-${side}-${run}/vitest.json`;
+              if (!existsSync(p)) { problems.push(`${side} ${run}: no results`); continue; }
+              const r = JSON.parse(readFileSync(p, "utf8"));
+              const secs = (readFileSync(`results/recheck-${side}-${run}/toolchain.txt`, "utf8").match(/secs=(\d+)/) ?? [])[1];
+              problems.push(...r.problems.map((x) => `${side} ${run}: ${x}`));
+              const bad = r.tests.filter((t) => BAD.has(t.status));
+              rows.push(`| ${side} | ${run} | ${r.rc} | ${secs}s | ${r.tests.length} | ${r.tests.filter((t) => t.status === "pass").length} | ${bad.length} | ${r.tests.filter((t) => t.status === "skip").length} |`);
+              for (const t of bad) {
+                const k = `${t.file} :: ${t.id}`;
+                if (!perId.has(k)) perId.set(k, { candidate: [], base: [] });
+                perId.get(k)[side].push(`${run}: ${t.err.slice(0, 80)}`);
+              }
+            }
+          }
+          const md = [
+            "## Vitest UI recheck", "", "| side | run | rc | time | records | pass | fail | skip |", "|---|---|---|---|---|---|---|---|", ...rows, "",
+            `### Failing identities (${perId.size})`,
+            ...[...perId].map(([k, v]) => `- ${k}\n  - candidate (${v.candidate.length}): ${v.candidate.join("; ")}\n  - base (${v.base.length}): ${v.base.join("; ")}`),
+            "", `### Problems (${problems.length})`, ...problems.map((p) => `- ${p}`),
+          ].join("\n");
+          writeFileSync("recheck-summary.md", md);
+          writeFileSync("recheck-summary.json", JSON.stringify({ rows, failing: Object.fromEntries(perId), problems }, null, 1));
+          appendFileSync(process.env.GITHUB_STEP_SUMMARY, md + "\n");
+          console.log(md);
+          EOF
+      - name: Upload summary
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: recheck-summary
+          path: recheck-summary.*
+          if-no-files-found: warn
