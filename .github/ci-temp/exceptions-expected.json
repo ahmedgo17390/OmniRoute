@@ -1,0 +1,98 @@
+{
+ "tests/unit/proxy-health-recovery-pass.test.ts": [
+  {
+   "id": "success ends the set-aside: the proxy is no longer avoided",
+   "status": "pass"
+  },
+  {
+   "id": "refusal re-records the set-aside with the existing doubling",
+   "status": "pass"
+  },
+  {
+   "id": "flag off (default): no probe runs",
+   "status": "pass"
+  },
+  {
+   "id": "the injected probe receives the egress key string (no id-object mismatch)",
+   "status": "pass"
+  }
+ ],
+ "tests/unit/quota-redis-store.test.ts": [
+  {
+   "id": "redisQuotaStore: consume calls INCRBYFLOAT + EXPIRE and returns sliding window value",
+   "status": "pass"
+  },
+  {
+   "id": "redisQuotaStore: getRedisClient throws clear error if ioredis not installed",
+   "status": "pass"
+  },
+  {
+   "id": "redisQuotaStore: real Redis integration (skipped unless RUN_QUOTA_REDIS_INT=1)",
+   "status": "skip"
+  },
+  {
+   "id": "redisQuotaStore: sliding window decay formula is correct",
+   "status": "pass"
+  },
+  {
+   "id": "redisQuotaStore: resetRedisQuotaStore resets the store singleton",
+   "status": "pass"
+  },
+  {
+   "id": "redis namespace prefix: quota store KEY_PREFIX derives from REDIS_KEY_PREFIX",
+   "status": "pass"
+  }
+ ],
+ "tests/unit/daily-reset-tz-threading.test.ts": [
+  {
+   "id": "checkFallbackError: Paris pre-spring-forward resolves to provider midnight",
+   "status": "pass"
+  },
+  {
+   "id": "checkFallbackError: Paris pre-fall-back resolves to provider midnight",
+   "status": "pass"
+  },
+  {
+   "id": "checkFallbackError: New York resolves to provider midnight, not host midnight",
+   "status": "pass"
+  },
+  {
+   "id": "checkFallbackError: unconfigured clock keeps the legacy host-midnight value",
+   "status": "pass"
+  },
+  {
+   "id": "checkFallbackError: invalid timezone falls back to legacy without throwing",
+   "status": "pass"
+  },
+  {
+   "id": "resolveComboDailyReset: matches id and prefix, null for unknown providers",
+   "status": "pass"
+  },
+  {
+   "id": "round-robin combo passes the node clock, and a timezone edit applies without restart",
+   "status": "pass"
+  },
+  {
+   "id": "priority combo attempt path passes the node clock to checkFallbackError",
+   "status": "pass"
+  }
+ ],
+ "tests/unit/proxy-health-recovery-plan.test.ts": [
+  {
+   "id": "only ip_quota_429 entries are planned",
+   "status": "pass"
+  },
+  {
+   "id": "proxy_unreachable is excluded even with a 429 observed for the same key",
+   "status": "pass"
+  },
+  {
+   "id": "null keys are never planned",
+   "status": "pass"
+  },
+  {
+   "id": "oldest set-aside first, cut at maxCandidates",
+   "status": "pass"
+  }
+ ]
+}

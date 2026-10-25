@@ -1,0 +1,346 @@
+# TEMPORARY Linux validation of the malformed tool-call arguments classification fix.
+# Lives only on test/malformed-tool-args-linux-20261025; never part of the fix branch.
+#
+# Every gate runs on BOTH the candidate and the untouched upstream base, and results are
+# compared by test identity, so a failure is classified from paired evidence:
+#   gate-focused  regression file (exact expected identities per side) + 398 related files,
+#                 plus typecheck/lint/format of the changed files on the candidate;
+#   gate-compare  candidate vs base, related identities and statuses;
+#   unit          8 shards x 3 stages per side; no --test-force-exit except for the named
+#                 known-hanging files, each accepted only on an exact identity+status match;
+#   vitest        MCP and UI per side;
+#   summary       whole-suite identity comparison and verdict.
+name: Malformed Tool Args Linux Validation
+
+on:
+  push:
+    branches: [test/malformed-tool-args-linux-20261025]
+
+concurrency:
+  group: malformed-tool-args-linux-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CAND_SHA: 13fb425e90ba4022a21f6cf71170ecbab6336d6f
+  BASE_SHA: 81e48878b90fb309ede580bca8b97c6953a2fc62
+  CI_NODE_MAJOR: "24"
+  DISABLE_SQLITE_AUTO_BACKUP: "true"
+  NEXT_TELEMETRY_DISABLED: "1"
+  OMNIROUTE_SKIP_SYSTEM_TRUST: "1"
+  # Same literal test values as ci.yml test-unit (not repository secrets).
+  JWT_SECRET: ci-test-secret-with-sufficient-length-for-validation
+  API_KEY_SECRET: ci-test-api-key-secret-long
+  NODE_OPTIONS: --max-old-space-size=8192
+  CI_DIR: ci-temp/.github/ci-temp
+  REGRESSION_TEST: tests/unit/malformed-tool-call-arguments-classification.test.ts
+  CHANGED_FILES: >-
+    open-sse/handlers/chatCore/malformedToolCallArguments.ts
+    open-sse/handlers/chatCore/nonStreamingResponse.ts
+    open-sse/handlers/responseTranslator.ts
+    open-sse/services/combo/comboPredicates.ts
+    open-sse/services/combo/executeTargetAttempt.ts
+    open-sse/utils/publicErrorIdentifiers.ts
+    src/sse/handlers/chatPredicates.ts
+    tests/unit/malformed-tool-call-arguments-classification.test.ts
+
+jobs:
+  gate-focused:
+    name: Focused gate (${{ matrix.side }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        side: [candidate, base]
+    env:
+      SIDE: ${{ matrix.side }}
+    steps:
+      - name: Resolve side commit
+        run: echo "SIDE_SHA=${{ matrix.side == 'candidate' && env.CAND_SHA || env.BASE_SHA }}" >> "$GITHUB_ENV"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ matrix.side == 'candidate' && env.CAND_SHA || env.BASE_SHA }}
+          fetch-depth: 3
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: ci-temp
+          sparse-checkout: .github/ci-temp
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.CI_NODE_MAJOR }}
+          package-manager-cache: false
+      - uses: ./.github/actions/npm-ci-retry
+        with:
+          cache: "false"
+      - name: Gate 0 - toolchain and isolation
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SIDE_SHA"
+          if [ "$SIDE" = candidate ]; then test "$(git rev-parse HEAD~2)" = "$BASE_SHA"; fi
+          test "${{ runner.environment }}" = "github-hosted"
+          node -v; npm -v
+          test "$(node -p 'process.versions.node.split(".")[0]')" = "$CI_NODE_MAJOR"
+          test "$(npm -v)" = "$(node -p "require('./config/ci/toolchain.json').npm")"
+          test -z "${DATA_DIR+x}" && test -z "${OMNIROUTE_ALLOW_DEFAULT_DATA_DIR+x}"
+          npm run check:node-runtime
+          mkdir -p out
+          { echo "node=$(node -v)"; echo "npm=$(npm -v)"; echo "sha=$(git rev-parse HEAD)"; echo "side=$SIDE"; } > out/toolchain.txt
+      - name: Regression file - candidate copy is identical; base side gets it (the red proof)
+        run: |
+          set -euo pipefail
+          if [ "$SIDE" = candidate ]; then
+            cmp "$REGRESSION_TEST" "$CI_DIR/regression.test.ts.txt"
+          else
+            test ! -e "$REGRESSION_TEST"
+            cp "$CI_DIR/regression.test.ts.txt" "$REGRESSION_TEST"
+            test "$(git status --porcelain --untracked-files=all -- . ':!ci-temp' ':!out' | tr -d '\n')" = "?? $REGRESSION_TEST"
+          fi
+      - name: Regression file and related tests (no force-exit, bounded)
+        run: |
+          set +e
+          B="node --max-old-space-size=8192 --import tsx/esm --import ./open-sse/utils/setupPolyfill.ts --import ./tests/_setup/isolateDataDir.ts --test"
+          timeout -k 15 600 $B --test-concurrency=1 --test-reporter=tap "$REGRESSION_TEST" > out/regression.tap 2> out/regression.stderr < /dev/null
+          printf 'regression\t%s\n' "$?" >> out/gate.rc.tsv
+          echo "RELATED_LIST=$PWD/$CI_DIR/related.lst" >> "$GITHUB_ENV"
+          timeout -k 30 2700 $B --test-concurrency=4 --test-reporter=spec --test-reporter-destination=stdout \
+            --test-reporter=junit --test-reporter-destination=out/related.junit.xml $(cat "$CI_DIR/related.lst") > out/related.log 2>&1 < /dev/null
+          printf 'related\t%s\n' "$?" >> out/gate.rc.tsv
+          grep -aE '^ℹ (tests|suites|pass|fail|cancelled|skipped|todo|duration_ms) ' out/related.log | tail -8 > out/related.summary
+          cat out/gate.rc.tsv out/related.summary
+          grep -aE '^# (tests|pass|fail) ' out/regression.tap
+          exit 0
+      - name: Focused results
+        run: node "$CI_DIR/gate-results.mjs" "$PWD/$CI_DIR/lib" "$CI_DIR/regression-expected.json"
+      - name: Typecheck (core and open-sse)
+        if: matrix.side == 'candidate'
+        run: |
+          set -euo pipefail
+          npm run typecheck:core
+          npm run typecheck:noimplicit:core
+          node scripts/check/check-open-sse-typecheck.mjs
+      - name: ESLint and Prettier on the changed files
+        if: matrix.side == 'candidate'
+        run: |
+          set -euo pipefail
+          test "$(git diff --name-only "$BASE_SHA" HEAD | sort | tr '\n' ' ')" = "$(printf '%s\n' $CHANGED_FILES | sort | tr '\n' ' ')"
+          npx --no-install eslint --suppressions-location config/quality/eslint-suppressions.json $CHANGED_FILES
+          npx --no-install prettier --check $CHANGED_FILES
+      - name: Upload focused results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: gate-${{ matrix.side }}
+          path: out/
+          if-no-files-found: error
+
+  gate-compare:
+    name: Focused gate comparison (candidate vs base)
+    needs: gate-focused
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: ci-temp
+          sparse-checkout: .github/ci-temp
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: gate-*
+          path: gates
+      - name: Compare related identities and statuses
+        run: node "$CI_DIR/compare.mjs" gate gates/gate-candidate/gate.json gates/gate-base/gate.json
+      - name: Upload comparison
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: gate-compare
+          path: gate-compare.*
+          if-no-files-found: error
+
+  unit:
+    name: Unit shard ${{ matrix.shard }}/8 (${{ matrix.side }})
+    needs: gate-compare
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        side: [candidate, base]
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+    env:
+      SIDE: ${{ matrix.side }}
+      SHARD: ${{ matrix.shard }}
+      TEST_SHARD: ${{ matrix.shard }}/8
+    steps:
+      - name: Resolve side commit
+        run: echo "SIDE_SHA=${{ matrix.side == 'candidate' && env.CAND_SHA || env.BASE_SHA }}" >> "$GITHUB_ENV"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ matrix.side == 'candidate' && env.CAND_SHA || env.BASE_SHA }}
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: ci-temp
+          sparse-checkout: .github/ci-temp
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.CI_NODE_MAJOR }}
+          package-manager-cache: false
+      - uses: ./.github/actions/npm-ci-retry
+        with:
+          cache: "false"
+      - name: Gate 0 - toolchain and isolation
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SIDE_SHA"
+          test "${{ runner.environment }}" = "github-hosted"
+          test "$(node -p 'process.versions.node.split(".")[0]')" = "$CI_NODE_MAJOR"
+          test "$(npm -v)" = "$(node -p "require('./config/ci/toolchain.json').npm")"
+          test -z "${DATA_DIR+x}" && test -z "${OMNIROUTE_ALLOW_DEFAULT_DATA_DIR+x}"
+          npm run check:node-runtime
+          mkdir -p out
+          { echo "node=$(node -v)"; echo "npm=$(npm -v)"; echo "sha=$(git rev-parse HEAD)"; echo "side=$SIDE"; echo "shard=$TEST_SHARD"; } > out/toolchain.txt
+      - name: Build the stage commands
+        run: node "$CI_DIR/shard-commands.mjs" "$SHARD" "$CI_DIR/exceptions-expected.json"
+      - name: Run the three stages (bounded; every stage runs even if one fails)
+        run: |
+          set +e
+          limits=(2700 900 900)
+          for i in 1 2 3; do
+            start=$(date +%s)
+            PATH="$PWD/node_modules/.bin:$PATH" timeout -k 30 "${limits[$((i - 1))]}" bash -c "$(cat "out/stage$i.cmd")" > "out/stage$i.log" 2>&1 < /dev/null
+            rc=$?
+            printf '%s\t%s\t%s\n' "$i" "$rc" "$(( $(date +%s) - start ))" >> out/stages.tsv
+            # -a: test output can contain NUL bytes.
+            grep -aE '^ℹ (tests|suites|pass|fail|cancelled|skipped|todo|duration_ms) ' "out/stage$i.log" | tail -8 > "out/stage$i.summary"
+            echo "::group::stage $i rc=$rc ($(( $(date +%s) - start ))s)"
+            cat "out/stage$i.summary"
+            awk '/failing tests:/{f=1} f' "out/stage$i.log" | grep -avE '^\s+at ' | head -200
+            echo "::endgroup::"
+          done
+          cat out/stages.tsv
+          exit 0
+      - name: Named known-hanging files alone with the original flags (verified per test)
+        run: |
+          set +e
+          k=0
+          while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            for a in 1 2 3 4 5; do
+              PATH="$PWD/node_modules/.bin:$PATH" timeout -k 15 300 bash -c "$(cat out/exception.prefix) '$f'" > "out/exception-$k-$a.tap" 2> "out/exception-$k-$a.err" < /dev/null
+              rc=$?
+              printf '%s\t%s\t%s\n' "$f" "$a" "$rc" | tee -a out/exceptions.rc.tsv
+              node --input-type=module -e "
+                const { parseTap } = await import('$PWD/$CI_DIR/lib/parse.mjs');
+                const { readFileSync } = await import('node:fs');
+                const exp = JSON.parse(readFileSync('$CI_DIR/exceptions-expected.json', 'utf8'))['$f'];
+                const got = parseTap('out/exception-$k-$a.tap');
+                const same = got.summary && got.tests.length === exp.length && exp.every((e, n) => got.tests[n]?.id === e.id && got.tests[n]?.status === e.status);
+                console.log('$f attempt $a: ' + got.tests.length + '/' + exp.length + ' exact=' + !!same);
+                process.exit(same ? 0 : 1);" 2>/dev/null && break
+            done
+            k=$((k + 1))
+          done < out/exceptions.lst
+          exit 0
+      - name: Shard results and consistency checks
+        run: node "$CI_DIR/shard-results.mjs" "$PWD/$CI_DIR/lib" "$CI_DIR/exceptions-expected.json"
+      - name: Upload shard results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: unit-${{ matrix.side }}-${{ matrix.shard }}
+          path: out/
+          if-no-files-found: error
+
+  vitest:
+    name: Vitest ${{ matrix.suite }} (${{ matrix.side }})
+    needs: unit
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        side: [candidate, base]
+        suite: [mcp, ui]
+    env:
+      SIDE: ${{ matrix.side }}
+      SUITE: ${{ matrix.suite }}
+    steps:
+      - name: Resolve side commit
+        run: echo "SIDE_SHA=${{ matrix.side == 'candidate' && env.CAND_SHA || env.BASE_SHA }}" >> "$GITHUB_ENV"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ matrix.side == 'candidate' && env.CAND_SHA || env.BASE_SHA }}
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: ci-temp
+          sparse-checkout: .github/ci-temp
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.CI_NODE_MAJOR }}
+          package-manager-cache: false
+      - uses: ./.github/actions/npm-ci-retry
+        with:
+          cache: "false"
+      - name: Gate 0 - toolchain and isolation
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SIDE_SHA"
+          test "${{ runner.environment }}" = "github-hosted"
+          test "$(node -p 'process.versions.node.split(".")[0]')" = "$CI_NODE_MAJOR"
+          test "$(npm -v)" = "$(node -p "require('./config/ci/toolchain.json').npm")"
+          test -z "${DATA_DIR+x}" && test -z "${OMNIROUTE_ALLOW_DEFAULT_DATA_DIR+x}"
+          mkdir -p out
+      - name: Run Vitest (same npm script as ci.yml, bounded)
+        run: |
+          set +e
+          script=$([ "$SUITE" = mcp ] && echo test:vitest || echo test:vitest:ui)
+          timeout -k 30 1500 npm run "$script" -- --reporter=default --reporter=junit --outputFile.junit=out/vitest.junit.xml > out/vitest.log 2>&1 < /dev/null
+          echo "VITEST_RC=$?" >> "$GITHUB_ENV"
+          tail -25 out/vitest.log
+          exit 0
+      - name: Vitest results
+        run: node "$CI_DIR/vitest-results.mjs" "$PWD/$CI_DIR/lib" "$VITEST_RC"
+      - name: Upload Vitest results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vitest-${{ matrix.side }}-${{ matrix.suite }}
+          path: out/
+          if-no-files-found: error
+
+  summary:
+    name: Verdict (whole-suite identity comparison)
+    needs: [gate-compare, unit, vitest]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: ci-temp
+          sparse-checkout: .github/ci-temp
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          path: results
+      - name: Compare and classify
+        run: |
+          ls results | sort | tr '\n' ' '; echo
+          node "$CI_DIR/compare.mjs" final results
+      - name: Upload verdict
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: final-summary
+          path: final-summary.*
+          if-no-files-found: warn
