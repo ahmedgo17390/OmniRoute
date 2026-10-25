@@ -27,8 +27,12 @@ import {
   extractThinkingFromContent,
   shouldParseTextualReasoningTags,
 } from "./responseSanitizer/reasoning.ts";
+import { safeParseJSON } from "../translator/helpers/jsonUtil.ts";
+import { logger } from "../utils/logger.ts";
 
 type JsonRecord = Record<string, unknown>;
+
+const claudeNonStreamLog = logger("CLAUDE_NONSTREAM");
 
 function toRecord(value: unknown): JsonRecord {
   return value && typeof value === "object" && !Array.isArray(value) ? (value as JsonRecord) : {};
@@ -761,6 +765,38 @@ function resolveReasoningText(messageObj: JsonRecord): string {
   return getAnyReasoningValue(messageObj);
 }
 
+type ToolArgsRejection = "invalid_json" | "non_object";
+
+const UNPARSEABLE = Symbol("unparseable");
+
+// Resolve an OpenAI `function.arguments` into a Claude `tool_use.input`.
+// Absent / null / "" keep the historical `{}` (zero-argument call). Anything else
+// must decode to a plain object: unparseable JSON, arrays and scalars (including
+// the string "null") are rejected so the call is never emitted as executable —
+// unlike `coerceToolCallArguments`, this call has not run yet.
+function resolveToolUseInput(
+  args: unknown
+): { input: JsonRecord } | { rejection: ToolArgsRejection } {
+  if (args === undefined || args === null || args === "") return { input: {} };
+  const parsed = typeof args === "string" ? safeParseJSON(args, UNPARSEABLE) : args;
+  if (parsed === UNPARSEABLE) return { rejection: "invalid_json" };
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { rejection: "non_object" };
+  }
+  return { input: parsed as JsonRecord };
+}
+
+// The tool name is upstream model output; only echo it into the notice/log when it
+// looks like an identifier, so a rejected call cannot inject arbitrary text.
+function safeToolNameForNotice(name: string): string {
+  return /^[A-Za-z0-9_.:-]{1,64}$/.test(name) ? name : "unknown";
+}
+
+function rejectedToolCallNotice(name: string, rejection: ToolArgsRejection): string {
+  const what = rejection === "invalid_json" ? "invalid JSON" : "non-object";
+  return `[OmniRoute] Tool call "${name}" was not executed: the upstream model returned ${what} arguments.`;
+}
+
 /**
  * Helper to convert an OpenAI chat.completion JSON object to Claude format for non-streaming.
  *
@@ -846,23 +882,45 @@ function convertOpenAINonStreamingToClaude(
     });
   }
 
+  const rejectedToolCalls: Array<{ name: string; rejection: ToolArgsRejection }> = [];
+  let emittedToolUse = false;
   if (Array.isArray(messageObj.tool_calls)) {
     for (const tool of messageObj.tool_calls) {
       const toolObj = toRecord(tool);
       const fn = toRecord(toolObj.function);
+      const name = restoreDeclaredToolName(toString(fn.name), toolNameMap ?? null, clientTools);
+      const resolved = resolveToolUseInput(fn.arguments);
+      if ("rejection" in resolved) {
+        // Non-executable, content-free notice in place of the call.
+        const safeName = safeToolNameForNotice(name);
+        rejectedToolCalls.push({ name: safeName, rejection: resolved.rejection });
+        content.push({ type: "text", text: rejectedToolCallNotice(safeName, resolved.rejection) });
+        continue;
+      }
       // An id-less call gets a random id; a timestamp collides across calls.
       const rawId = toString(toolObj.id) || undefined;
       content.push({
         type: "tool_use",
         id: sanitizeToolId(rawId),
-        name: restoreDeclaredToolName(toString(fn.name), toolNameMap ?? null, clientTools),
-        input:
-          typeof fn.arguments === "string" ? JSON.parse(fn.arguments || "{}") : fn.arguments || {},
+        name,
+        input: resolved.input,
       });
+      emittedToolUse = true;
     }
   }
 
-  const stopReason = openAIFinishReasonToClaudeStopReason(choiceObj.finish_reason);
+  let stopReason = openAIFinishReasonToClaudeStopReason(choiceObj.finish_reason);
+  if (rejectedToolCalls.length > 0) {
+    // One warning per response; never the argument content or call ids.
+    claudeNonStreamLog.warn("Rejected tool call(s) with invalid arguments", {
+      rejected: rejectedToolCalls.length,
+      reasons: [...new Set(rejectedToolCalls.map((c) => c.rejection))],
+      tools: [...new Set(rejectedToolCalls.map((c) => c.name))],
+    });
+    // No surviving tool_use: "tool_use" would make the client wait on a call that does
+    // not exist. Other reasons (max_tokens, …) stay as the upstream reported them.
+    if (!emittedToolUse && stopReason === "tool_use") stopReason = "end_turn";
+  }
 
   const usageSrc = toRecord(openaiResponse.usage);
   const promptTokens = toNumber(usageSrc.prompt_tokens, 0);
