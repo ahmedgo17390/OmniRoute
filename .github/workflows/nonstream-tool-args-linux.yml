@@ -1,7 +1,8 @@
 # TEMPORARY validation workflow for the non-streaming malformed tool-arguments fix.
 # Lives only on test/nonstream-tool-args-linux-20261025; never part of the fix branch.
 # Gates: 0 toolchain, 1 focused/related/typecheck/lint, 1b failing-before proof,
-# 2 matched baseline-vs-candidate comparison of the macOS-dependent failures.
+# 2 matched baseline-vs-candidate comparison of the macOS-dependent failures,
+# 3 full Linux unit suite (8 shards) + Vitest MCP + Vitest UI on the fix commit.
 name: Nonstream Tool Args Linux Validation
 
 on:
@@ -474,4 +475,220 @@ jobs:
         with:
           name: gate2-compare
           path: gate2-compare.*
+          if-no-files-found: warn
+
+  unit-shards:
+    name: Gate 3 unit shard ${{ matrix.shard }}/8
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+    env:
+      # Same literal test values as ci.yml test-unit (not repository secrets).
+      JWT_SECRET: ci-test-secret-with-sufficient-length-for-validation
+      API_KEY_SECRET: ci-test-api-key-secret-long
+      TEST_SHARD: ${{ matrix.shard }}/8
+      NODE_OPTIONS: --max-old-space-size=8192
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.FIX_SHA }}
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.CI_NODE_MAJOR }}
+          package-manager-cache: false
+      - uses: ./.github/actions/npm-ci-retry
+        with:
+          cache: "false"
+      - name: Gate 0 - toolchain and isolation
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$FIX_SHA"
+          test "${{ runner.environment }}" = "github-hosted"
+          node -v; npm -v
+          test "$(node -p 'process.versions.node.split(".")[0]')" = "$CI_NODE_MAJOR"
+          test "$(npm -v)" = "$(node -p "require('./config/ci/toolchain.json').npm")"
+          test -z "${DATA_DIR+x}" && test -z "${OMNIROUTE_ALLOW_DEFAULT_DATA_DIR+x}"
+          npm run check:node-runtime
+      - name: Run all three stages of test:unit:ci:shard (bounded)
+        # The exact package.json stage commands, but every stage runs even if an earlier
+        # one fails (ci.yml chains them with &&), so each stage leaves a full summary.
+        run: |
+          mkdir -p out
+          node -e '
+            const parts = require("./package.json").scripts["test:unit:ci:shard"].split(" && ");
+            if (parts.length !== 3) { console.error("expected 3 stages, got " + parts.length); process.exit(1); }
+            parts.forEach((c, i) => require("fs").writeFileSync(`out/stage${i + 1}.cmd`, c));'
+          limits=(1800 600 600)
+          for i in 1 2 3; do
+            start=$(date +%s)
+            set +e
+            PATH="$PWD/node_modules/.bin:$PATH" timeout -k 30 "${limits[$((i - 1))]}" bash -c "$(cat "out/stage$i.cmd")" > "out/stage$i.log" 2>&1
+            rc=$?
+            set -e
+            printf '%s\t%s\t%s\n' "$i" "$rc" "$(( $(date +%s) - start ))" >> out/stages.tsv
+            grep -E '^ℹ (tests|suites|pass|fail|cancelled|skipped|todo|duration_ms) ' "out/stage$i.log" | tail -8 > "out/stage$i.summary" || true
+            echo "::group::stage $i rc=$rc ($(( $(date +%s) - start ))s)"
+            cat "out/stage$i.summary"
+            awk '/failing tests:/{f=1} f' "out/stage$i.log" | grep -vE '^\s+at ' | head -400
+            echo "::endgroup::"
+          done
+          cat out/stages.tsv
+      - name: Shard verdict
+        run: |
+          cat out/stages.tsv
+          awk -F'\t' '$2 != 0 {bad=1} END {exit bad}' out/stages.tsv
+      - name: Upload shard logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: gate3-unit-shard-${{ matrix.shard }}
+          path: out/
+          if-no-files-found: error
+
+  vitest:
+    name: Gate 3 Vitest (MCP + UI)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      JWT_SECRET: ci-test-secret-with-sufficient-length-for-validation
+      API_KEY_SECRET: ci-test-api-key-secret-long
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.FIX_SHA }}
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.CI_NODE_MAJOR }}
+          package-manager-cache: false
+      - uses: ./.github/actions/npm-ci-retry
+        with:
+          cache: "false"
+      - name: Gate 0 - toolchain and isolation
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$FIX_SHA"
+          test "${{ runner.environment }}" = "github-hosted"
+          node -v; npm -v
+          test "$(node -p 'process.versions.node.split(".")[0]')" = "$CI_NODE_MAJOR"
+          test "$(npm -v)" = "$(node -p "require('./config/ci/toolchain.json').npm")"
+          test -z "${DATA_DIR+x}" && test -z "${OMNIROUTE_ALLOW_DEFAULT_DATA_DIR+x}"
+      - name: Vitest MCP and Vitest UI (same commands as ci.yml, bounded)
+        run: |
+          mkdir -p out
+          set +e
+          timeout -k 30 900 npm run test:vitest -- --reporter=default --reporter=junit --outputFile.junit=out/vitest-mcp.xml > out/vitest-mcp.log 2>&1
+          mcp=$?
+          timeout -k 30 900 npm run test:vitest:ui -- --reporter=default --reporter=junit --outputFile.junit=out/vitest-ui.xml > out/vitest-ui.log 2>&1
+          ui=$?
+          set -e
+          printf 'mcp\t%s\nui\t%s\n' "$mcp" "$ui" > out/vitest-rc.tsv
+          for s in mcp ui; do echo "::group::vitest $s"; tail -25 "out/vitest-$s.log"; echo "::endgroup::"; done
+          cat out/vitest-rc.tsv
+          test "$mcp" = 0 && test "$ui" = 0
+      - name: Upload Vitest logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: gate3-vitest
+          path: out/
+          if-no-files-found: error
+
+  gate3-summary:
+    name: Gate 3 summary (classified against known baseline failures)
+    needs: [unit-shards, vitest]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: gate3-*
+          path: gate3
+      - name: Aggregate and classify
+        run: |
+          cat > summarize.mjs <<'EOF'
+          import { readFileSync, existsSync, writeFileSync, appendFileSync } from "node:fs";
+          // Only failures with matched-baseline evidence on Linux (run 40175740006, Gate 2).
+          const KNOWN = new Set([
+            "tests/unit/cli-env-quality-docs-mirrors.test.ts :: CodeBuddy rows preserve the opt-in cap and replacement provenance in every locale",
+            "tests/unit/resilience-pre-dispatch-docs-mirrors.test.ts :: every resilience mirror includes the pre-dispatch retry and terminal contracts",
+          ]);
+          const STAGES = ["main", "dashboard", "serial"];
+          const rows = [], failures = [], infra = [];
+          const total = { tests: 0, pass: 0, fail: 0, cancelled: 0, skipped: 0, todo: 0 };
+          for (let s = 1; s <= 8; s++) {
+            const dir = `gate3/gate3-unit-shard-${s}`;
+            if (!existsSync(`${dir}/stages.tsv`)) { infra.push(`shard ${s}: no stage results (job did not complete)`); continue; }
+            const rcs = readFileSync(`${dir}/stages.tsv`, "utf8").trim().split("\n").map((l) => l.split("\t"));
+            for (const [i, rc, secs] of rcs) {
+              const sum = {};
+              for (const l of readFileSync(`${dir}/stage${i}.summary`, "utf8").split("\n")) {
+                const m = l.match(/^ℹ (\w+) ([\d.]+)$/); if (m) sum[m[1]] = Number(m[2]);
+              }
+              const stage = `${s}/8 ${STAGES[i - 1]}`;
+              if (!("tests" in sum)) infra.push(`shard ${stage}: no runner summary (rc=${rc}${rc === "124" || rc === "137" ? ", stage timeout" : ""})`);
+              else if (rc !== "0" && !(sum.fail > 0 || sum.cancelled > 0)) infra.push(`shard ${stage}: rc=${rc} with no failing test`);
+              for (const k of Object.keys(total)) total[k] += sum[k] ?? 0;
+              rows.push(`| ${stage} | ${rc} | ${secs}s | ${sum.tests ?? "—"} | ${sum.pass ?? "—"} | ${sum.fail ?? "—"} | ${sum.cancelled ?? "—"} | ${sum.skipped ?? "—"} | ${sum.todo ?? "—"} |`);
+              const log = readFileSync(`${dir}/stage${i}.log`, "utf8").split("\n");
+              const start = log.findIndex((l) => /failing tests:/.test(l));
+              if (start >= 0) for (let j = start; j < log.length; j++) {
+                const at = log[j].match(/^test at (.+?):\d+:\d+$/);
+                if (!at) continue;
+                const name = (log[j + 1] ?? "").replace(/^✖ /, "").replace(/ \([\d.]+m?s\)$/, "");
+                const err = (log.slice(j + 2, j + 6).map((x) => x.trim()).find((x) => x && !/^at /.test(x)) ?? "").slice(0, 140);
+                const file = at[1].replace(/^.*?(tests\/unit\/)/, "$1");
+                failures.push({ where: stage, id: `${file} :: ${name}`, err });
+              }
+            }
+          }
+          const vit = [];
+          for (const s of ["mcp", "ui"]) {
+            const xml = `gate3/gate3-vitest/vitest-${s}.xml`;
+            const rcLine = existsSync("gate3/gate3-vitest/vitest-rc.tsv") ? readFileSync("gate3/gate3-vitest/vitest-rc.tsv", "utf8").split("\n").find((l) => l.startsWith(s + "\t")) : null;
+            const rc = rcLine ? rcLine.split("\t")[1] : "missing";
+            if (!existsSync(xml)) { infra.push(`vitest ${s}: no JUnit report (rc=${rc})`); vit.push(`| vitest ${s} | ${rc} | — | — | — | — |`); continue; }
+            const x = readFileSync(xml, "utf8");
+            const cases = [...x.matchAll(/<testcase\b([^>]*?)(\/>|>([\s\S]*?)<\/testcase>)/g)];
+            const attr = (a, k) => (a.match(new RegExp(`${k}="([^"]*)"`)) ?? [])[1] ?? "";
+            let pass = 0, fail = 0, skip = 0;
+            for (const c of cases) {
+              const body = c[3] ?? "";
+              if (/<failure|<error/.test(body)) { fail++; failures.push({ where: `vitest ${s}`, id: `${attr(c[1], "classname")} :: ${attr(c[1], "name")}`, err: (body.match(/message="([^"]*)"/) ?? [, ""])[1].slice(0, 140) }); }
+              else if (/<skipped/.test(body)) skip++;
+              else pass++;
+            }
+            if (rc !== "0" && fail === 0) infra.push(`vitest ${s}: rc=${rc} with no failing test`);
+            vit.push(`| vitest ${s} | ${rc} | ${cases.length} | ${pass} | ${fail} | ${skip} |`);
+          }
+          const cls = failures.map((f) => ({ ...f, cls: KNOWN.has(f.id) ? "KNOWN-BASELINE (Linux Gate 2 evidence)" : "UNEXPECTED (no baseline evidence)" }));
+          const unexpected = cls.filter((f) => f.cls.startsWith("UNEXPECTED"));
+          const known = cls.filter((f) => f.cls.startsWith("KNOWN"));
+          const verdict = infra.length ? "INCONCLUSIVE" : unexpected.length ? "FAIL" : known.length ? "PASS WITH BASELINE FAILURES" : "FULL-SUITE PASS";
+          const md = [
+            `## Gate 3 verdict: ${verdict}`, ``,
+            `Unit total: ${JSON.stringify(total)}`, ``,
+            `| shard / stage | rc | time | tests | pass | fail | cancelled | skipped | todo |`, `|---|---|---|---|---|---|---|---|---|`, ...rows, ``,
+            `| suite | rc | tests | pass | fail | skipped |`, `|---|---|---|---|---|---|`, ...vit, ``,
+            `### Failures (${cls.length}: ${known.length} known-baseline, ${unexpected.length} unexpected)`,
+            ...cls.map((f) => `- [${f.cls}] ${f.where} — ${f.id} — ${f.err}`), ``,
+            `### Infrastructure issues (${infra.length})`, ...infra.map((i) => `- ${i}`),
+          ].join("\n");
+          writeFileSync("gate3-summary.md", md);
+          writeFileSync("gate3-summary.json", JSON.stringify({ verdict, total, failures: cls, infra }, null, 1));
+          appendFileSync(process.env.GITHUB_STEP_SUMMARY, md + "\n");
+          console.log(md);
+          EOF
+          node summarize.mjs
+      - name: Upload Gate 3 summary
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: gate3-summary
+          path: gate3-summary.*
           if-no-files-found: warn
