@@ -1,0 +1,477 @@
+# TEMPORARY validation workflow for the non-streaming malformed tool-arguments fix.
+# Lives only on test/nonstream-tool-args-linux-20261025; never part of the fix branch.
+# Gates: 0 toolchain, 1 focused/related/typecheck/lint, 1b failing-before proof,
+# 2 matched baseline-vs-candidate comparison of the macOS-dependent failures.
+name: Nonstream Tool Args Linux Validation
+
+on:
+  push:
+    branches: [test/nonstream-tool-args-linux-20261025]
+
+concurrency:
+  group: nonstream-tool-args-linux-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  FIX_SHA: 8fd2e261e2a069c637d9f4383cbed8fddc036647
+  BASE_SHA: d851a09f97de12c0eac699068e108e8a61156914
+  CI_NODE_MAJOR: "24"
+  DISABLE_SQLITE_AUTO_BACKUP: "true"
+  NEXT_TELEMETRY_DISABLED: "1"
+  OMNIROUTE_SKIP_SYSTEM_TRUST: "1"
+  FOCUSED_TEST: tests/unit/translator-nonstream-claude-tool-args.test.ts
+  NODE_TEST: >-
+    node --max-old-space-size=8192 --import tsx/esm --import ./open-sse/utils/setupPolyfill.ts
+    --import ./tests/_setup/isolateDataDir.ts --test --test-force-exit --test-reporter=tap
+  # TAP -> JSON: one record per test (suites excluded) plus the runner summary.
+  TAP_PARSER: |
+    import { readFileSync } from "node:fs";
+    const unesc = (s) => s.replace(/\\#/g, "#").replace(/\\\\/g, "\\");
+    export function parseTap(file) {
+      const lines = readFileSync(file, "utf8").split("\n");
+      const stack = [];
+      const tests = [];
+      const summary = {};
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        const sub = line.match(/^( *)# Subtest: (.*)$/);
+        if (sub) { const lvl = sub[1].length / 4; stack.length = lvl; stack[lvl] = unesc(sub[2]); continue; }
+        const sm = line.match(/^# (tests|suites|pass|fail|cancelled|skipped|todo|duration_ms) ([\d.]+)$/);
+        if (sm) { summary[sm[1]] = Number(sm[2]); continue; }
+        const r = line.match(/^( *)(ok|not ok) \d+ - (.*?)(?: # (SKIP|TODO)\b.*)?$/);
+        if (!r) continue;
+        const lvl = r[1].length / 4;
+        const name = unesc(r[3]);
+        const meta = {};
+        if ((lines[i + 1] ?? "").trim() === "---") {
+          const pad = r[1] + "  ";
+          let j = i + 2;
+          for (; j < lines.length && lines[j] !== pad + "..."; j++) {
+            const kv = lines[j].match(/^ *(type|failureType|error|code): ?(.*)$/);
+            if (!kv || !lines[j].startsWith(pad) || lines[j].startsWith(pad + " ")) continue;
+            let v = kv[2];
+            if (v === "|-" || v === "|" || v === ">-") {
+              const body = [];
+              while (j + 1 < lines.length && lines[j + 1].startsWith(pad + "  ")) body.push(lines[++j].trim());
+              v = body.join("\n");
+            } else v = v.replace(/^'(.*)'$/, "$1").replace(/''/g, "'");
+            meta[kv[1]] = v;
+          }
+          i = j;
+        }
+        if (meta.type === "suite") continue;
+        let status = r[2] === "ok" ? (r[4] ? r[4].toLowerCase() : "pass") : "fail";
+        if (status === "fail" && meta.failureType === "testTimeoutFailure") status = "timeout";
+        if (status === "fail" && meta.failureType === "cancelledByParent") status = "cancelled";
+        tests.push({ id: [...stack.slice(0, lvl), name].join(" > "), status, err: meta.error ?? "", code: meta.code ?? "" });
+      }
+      return { tests, summary: Object.keys(summary).length ? summary : null };
+    }
+
+jobs:
+  focused:
+    name: Gate 0 + Gate 1 (focused, related, typecheck, lint)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.FIX_SHA }}
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.CI_NODE_MAJOR }}
+          package-manager-cache: false
+      - uses: ./.github/actions/npm-ci-retry
+        with:
+          cache: "false"
+      - name: Gate 0 - toolchain and isolation
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$FIX_SHA"
+          test "${{ runner.environment }}" = "github-hosted"
+          node -v; npm -v
+          test "$(node -p 'process.versions.node.split(".")[0]')" = "$CI_NODE_MAJOR"
+          test "$(npm -v)" = "$(node -p "require('./config/ci/toolchain.json').npm")"
+          test -z "${DATA_DIR+x}" && test -z "${OMNIROUTE_ALLOW_DEFAULT_DATA_DIR+x}"
+          npm run check:node-runtime
+      - name: Write TAP parser
+        run: printf '%s' "$TAP_PARSER" > "$RUNNER_TEMP/tap.mjs"
+      - name: Gate 1 - focused regression test (expect 29/29)
+        run: |
+          set +e
+          $NODE_TEST --test-concurrency=1 --test-timeout=120000 "$FOCUSED_TEST" > focused.tap 2> focused.stderr
+          rc=$?
+          set -e
+          tail -9 focused.tap
+          node --input-type=module -e "
+            const { parseTap } = await import('$RUNNER_TEMP/tap.mjs');
+            const { tests, summary } = parseTap('focused.tap');
+            const bad = tests.filter((t) => t.status !== 'pass');
+            for (const t of bad) console.log('NOT PASS:', t.status, t.id, '|', t.err.split('\n')[0]);
+            const ok = $rc === 0 && summary && summary.tests === 29 && summary.pass === 29 && tests.length === 29 && bad.length === 0;
+            console.log('rc=$rc', JSON.stringify(summary));
+            process.exit(ok ? 0 : 1);"
+      - name: Gate 1 - related tests (expect 527/527 in 42 files)
+        run: |
+          cat > related.lst <<'EOF'
+          tests/unit/12186-preserve-zwnj-zwj.test.ts
+          tests/unit/9536-usage-misreporting-openai-to-claude.test.ts
+          tests/unit/cache-creation-marker.test.ts
+          tests/unit/chatcore-semantic-cache.test.ts
+          tests/unit/claude-client-stop-reasons.test.ts
+          tests/unit/claude-code-tool-casing-identity-echo.test.ts
+          tests/unit/claude-format-declared-tool-casing.test.ts
+          tests/unit/claude-nonstream-stop-reasons.test.ts
+          tests/unit/claude-refusal-stop-reason.test.ts
+          tests/unit/claude-thinking-continuity.test.ts
+          tests/unit/gemini-buffered-cache-usage.test.ts
+          tests/unit/gemini-finish-reason-normalization.test.ts
+          tests/unit/gemini-midstream-nonstreaming-responses.test.ts
+          tests/unit/gemini-usage-total-fallback.test.ts
+          tests/unit/issue-13558-minimax-m3-think-leak.test.ts
+          tests/unit/issue-15088-native-responses-collaboration-plaintext.test.ts
+          tests/unit/issue-15764-empty-text-next-to-tool-use.test.ts
+          tests/unit/issue-6623-opencode-mimo-reasoning-details-nonstream.test.ts
+          tests/unit/issue-7856-copilot-reasoning-text-nonstream.test.ts
+          tests/unit/json-mode-fence-unwrap.test.ts
+          tests/unit/non-streaming-client-translate.test.ts
+          tests/unit/nonstream-usage-cache-tokens.test.ts
+          tests/unit/nonstreaming-gemini-family-response-projection.test.ts
+          tests/unit/nvidia-tool-compatibility-2840.test.ts
+          tests/unit/openai-responses-opencode-subagent-sessionid.test.ts
+          tests/unit/openai-to-claude-toolcall-keying.test.ts
+          tests/unit/plan3-p0.test.ts
+          tests/unit/reasoning-cache.test.ts
+          tests/unit/repro-9500-reasoning-separator.test.ts
+          tests/unit/responses-client-incomplete-nonstreaming.test.ts
+          tests/unit/responses-history-tool-identity-12996.test.ts
+          tests/unit/responses-incomplete-nonstreaming-chat.test.ts
+          tests/unit/responses-provider-prefix-tool-name.test.ts
+          tests/unit/responses-refusal-preservation.test.ts
+          tests/unit/t19-codex-responses-empty-content.test.ts
+          tests/unit/tool-use-id-sanitization.test.ts
+          tests/unit/translator-nonstream-reasoning-leak-502.test.ts
+          tests/unit/translator-resp-claude-to-openai.test.ts
+          tests/unit/translator-resp-gemini-to-openai.test.ts
+          tests/unit/translator-resp-openai-to-claude.test.ts
+          tests/unit/usage-cache-write-roundtrip.test.ts
+          tests/unit/usage-extractor.test.ts
+          EOF
+          sed -i 's/^ *//' related.lst
+          test "$(grep -c . related.lst)" = 42
+          set +e
+          xargs $NODE_TEST --test-concurrency=4 --test-timeout=300000 < related.lst > related.tap 2> related.stderr
+          rc=$?
+          set -e
+          tail -9 related.tap
+          node --input-type=module -e "
+            const { parseTap } = await import('$RUNNER_TEMP/tap.mjs');
+            const { tests, summary } = parseTap('related.tap');
+            const bad = tests.filter((t) => t.status !== 'pass' && t.status !== 'skip' && t.status !== 'todo');
+            for (const t of bad) console.log('NOT PASS:', t.status, t.id, '|', t.err.split('\n')[0]);
+            const ok = $rc === 0 && summary && summary.tests === 527 && summary.fail === 0 && summary.cancelled === 0 && bad.length === 0;
+            console.log('rc=$rc', JSON.stringify(summary));
+            process.exit(ok ? 0 : 1);"
+      - name: Gate 1 - typecheck core
+        run: npm run typecheck:core
+      - name: Gate 1 - open-sse typecheck
+        run: node scripts/check/check-open-sse-typecheck.mjs
+      - name: Gate 1 - lint and format of the changed files
+        run: |
+          npx --no-install eslint --suppressions-location config/quality/eslint-suppressions.json \
+            open-sse/handlers/responseTranslator.ts "$FOCUSED_TEST"
+          npx --no-install prettier --check open-sse/handlers/responseTranslator.ts "$FOCUSED_TEST"
+      - name: Upload Gate 1 logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: gate1-logs
+          path: |
+            *.tap
+            *.stderr
+          if-no-files-found: warn
+
+  failing-before:
+    name: Gate 1b (new test against the unfixed implementation)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.FIX_SHA }}
+          fetch-depth: 2
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.CI_NODE_MAJOR }}
+          package-manager-cache: false
+      - uses: ./.github/actions/npm-ci-retry
+        with:
+          cache: "false"
+      - name: Gate 0 - toolchain and isolation
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$FIX_SHA"
+          test "$(git rev-parse HEAD^)" = "$BASE_SHA"
+          test "${{ runner.environment }}" = "github-hosted"
+          node -v; npm -v
+          test "$(node -p 'process.versions.node.split(".")[0]')" = "$CI_NODE_MAJOR"
+          test "$(npm -v)" = "$(node -p "require('./config/ci/toolchain.json').npm")"
+          test -z "${DATA_DIR+x}" && test -z "${OMNIROUTE_ALLOW_DEFAULT_DATA_DIR+x}"
+          npm run check:node-runtime
+      - name: Restore the unfixed implementation (runner-local only)
+        run: |
+          set -euo pipefail
+          git checkout "$BASE_SHA" -- open-sse/handlers/responseTranslator.ts
+          # The tree must now equal the baseline plus exactly the new test file.
+          diff <(git diff --name-status "$BASE_SHA") <(printf 'A\t%s\n' "$FOCUSED_TEST")
+          echo "tree = $BASE_SHA + $FOCUSED_TEST"
+      - name: Write TAP parser
+        run: printf '%s' "$TAP_PARSER" > "$RUNNER_TEMP/tap.mjs"
+      - name: Gate 1b - expect exactly the 22 known regression failures
+        run: |
+          cat > expected-fail.txt <<'EOF'
+          a non-identifier tool name is not echoed into the notice
+          an already-parsed array is rejected
+          an empty-argument call survives next to a rejected one
+          does not throw on truncated JSON arguments
+          finish_reason length keeps max_tokens when the only call is truncated
+          JSON array -> non-object notice
+          JSON scalar "just a string" -> non-object notice
+          JSON scalar 0 -> non-object notice
+          JSON scalar 42 -> non-object notice
+          JSON scalar false -> non-object notice
+          JSON scalar true -> non-object notice
+          keeps valid calls (id, name, input) and stop_reason tool_use
+          logs one sanitized warning per response with rejected calls
+          never emits a JSON array as tool_use.input
+          never emits a JSON scalar as tool_use.input ("just a string")
+          never emits a JSON scalar as tool_use.input (42)
+          never emits a JSON scalar as tool_use.input (null)
+          never emits a JSON scalar as tool_use.input (true)
+          preserves assistant text alongside the notice
+          the JSON string "null" is rejected, not treated as empty
+          the notice never echoes argument content or the call id
+          truncated JSON -> invalid JSON notice, end_turn
+          EOF
+          sed -i 's/^ *//' expected-fail.txt
+          set +e
+          $NODE_TEST --test-concurrency=1 --test-timeout=120000 "$FOCUSED_TEST" > before.tap 2> before.stderr
+          rc=$?
+          set -e
+          tail -9 before.tap
+          node --input-type=module -e "
+            import { readFileSync } from 'node:fs';
+            const { parseTap } = await import('$RUNNER_TEMP/tap.mjs');
+            const { tests, summary } = parseTap('before.tap');
+            const expected = new Set(readFileSync('expected-fail.txt', 'utf8').split('\n').filter(Boolean));
+            const leaf = (t) => t.id.split(' > ').pop();
+            const failed = tests.filter((t) => t.status === 'fail');
+            const other = tests.filter((t) => t.status !== 'fail' && t.status !== 'pass');
+            const failedNames = new Set(failed.map(leaf));
+            const missing = [...expected].filter((n) => !failedNames.has(n));
+            const unexpected = [...failedNames].filter((n) => !expected.has(n));
+            // Infrastructure signatures must never be what makes the test red.
+            const infra = /ERR_MODULE_NOT_FOUND|Cannot find (module|package)|ERR_UNKNOWN_FILE_EXTENSION|ENOENT|EACCES|ERR_REQUIRE|timed out|out of memory/i;
+            const infraHits = tests.filter((t) => infra.test(t.err));
+            const proofParse = failed.some((t) => /JSON/.test(t.err) && /SyntaxError|Unterminated|Unexpected/.test(t.err + t.code));
+            const proofShape = failed.some((t) => /tool_use\.input must be a plain object/.test(t.err));
+            const proofExec = failed.some((t) => /rejected call must not be emitted as tool_use/.test(t.err));
+            console.log('rc=$rc', JSON.stringify(summary));
+            console.log('missing expected failures:', missing);
+            console.log('unexpected failures:', unexpected);
+            console.log('non pass/fail statuses:', other.map((t) => t.status + ' ' + t.id));
+            console.log('infra-signature failures:', infraHits.map((t) => t.id + ' | ' + t.err.split('\n')[0]));
+            console.log('defect proof: parse-throw', proofParse, '| non-object input', proofShape, '| executable rejected call', proofExec);
+            const ok = $rc === 1 && summary && summary.tests === 29 && summary.pass === 7 && summary.fail === 22 &&
+              summary.cancelled === 0 && tests.length === 29 && failed.length === 22 && missing.length === 0 &&
+              unexpected.length === 0 && other.length === 0 && infraHits.length === 0 && proofParse && proofShape && proofExec;
+            console.log(ok ? 'GATE 1b PASS: defect reproduced exactly on the unfixed implementation' : 'GATE 1b FAIL');
+            process.exit(ok ? 0 : 1);"
+      - name: Upload Gate 1b logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: gate1b-logs
+          path: |
+            before.tap
+            before.stderr
+          if-no-files-found: warn
+
+  matched:
+    name: Gate 2 run (${{ matrix.side }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - side: baseline
+            sha: d851a09f97de12c0eac699068e108e8a61156914
+          - side: candidate
+            sha: 8fd2e261e2a069c637d9f4383cbed8fddc036647
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ matrix.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.CI_NODE_MAJOR }}
+          package-manager-cache: false
+      - uses: ./.github/actions/npm-ci-retry
+        with:
+          cache: "false"
+      - name: Gate 0 - toolchain and isolation
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${{ matrix.sha }}"
+          test "${{ runner.environment }}" = "github-hosted"
+          node -v; npm -v
+          test "$(node -p 'process.versions.node.split(".")[0]')" = "$CI_NODE_MAJOR"
+          test "$(npm -v)" = "$(node -p "require('./config/ci/toolchain.json').npm")"
+          test -z "${DATA_DIR+x}" && test -z "${OMNIROUTE_ALLOW_DEFAULT_DATA_DIR+x}"
+          npm run check:node-runtime
+          { echo "node=$(node -v)"; echo "npm=$(npm -v)"; echo "sha=$(git rev-parse HEAD)"; } > toolchain.txt
+      - name: Write TAP parser
+        run: printf '%s' "$TAP_PARSER" > "$RUNNER_TEMP/tap.mjs"
+      - name: Run the 22 comparison files one process each (bounded)
+        run: |
+          cat > files.lst <<'EOF'
+          tests/unit/api/v1/relay-completions-errors.test.ts
+          tests/unit/binaryManager.test.ts
+          tests/unit/build/standalone-cli-loader-12152.test.ts
+          tests/unit/call-log-file-rotation.test.ts
+          tests/unit/cli-env-quality-docs-mirrors.test.ts
+          tests/unit/compression/llmlingua-worker-resolution.test.ts
+          tests/unit/cursor-h2-proxy-tunnel.test.ts
+          tests/unit/dockerfile-better-sqlite3-node-gyp-6700.test.ts
+          tests/unit/electron-packaging.test.ts
+          tests/unit/files-batches-list-header-scope-14481.test.ts
+          tests/unit/h2c-upgrade-guard.test.ts
+          tests/unit/new-worktree-lock.test.ts
+          tests/unit/onnx-install-env-16225.test.ts
+          tests/unit/provider-translate-path-golden.test.ts
+          tests/unit/resilience-pre-dispatch-docs-mirrors.test.ts
+          tests/unit/runner-janitor.test.ts
+          tests/unit/scripts-dev-ci-discriminate.test.ts
+          tests/unit/scripts-dev-typecheck-touched.test.ts
+          tests/unit/services/portProbePid.test.ts
+          tests/unit/upstream-http2-transport.test.ts
+          tests/unit/lib/warmupScheduler/circuitBreakerFactoryConcurrency.test.ts
+          tests/unit/lib/warmupScheduler/circuitBreakerFactoryRelease.test.ts
+          EOF
+          sed -i 's/^ *//' files.lst
+          test "$(grep -c . files.lst)" = 22
+          mkdir -p out
+          while read -r f; do
+            slug=$(echo "$f" | sed 's#^tests/unit/##; s#/#__#g; s#\.test\.[a-z]*$##')
+            start=$(date +%s)
+            set +e
+            timeout -k 15 300 $NODE_TEST --test-concurrency=1 --test-timeout=120000 "$f" > "out/$slug.tap" 2> "out/$slug.stderr"
+            rc=$?
+            set -e
+            printf '%s\t%s\t%s\t%ss\n' "$f" "$slug" "$rc" "$(( $(date +%s) - start ))" | tee -a out/manifest.tsv
+          done < files.lst
+      - name: Parse results
+        run: |
+          node --input-type=module -e "
+            import { readFileSync, writeFileSync } from 'node:fs';
+            const { parseTap } = await import('$RUNNER_TEMP/tap.mjs');
+            const files = readFileSync('out/manifest.tsv', 'utf8').trim().split('\n').map((l) => l.split('\t'));
+            const result = files.map(([file, slug, rc, secs]) => ({ file, rc: Number(rc), secs, ...parseTap('out/' + slug + '.tap') }));
+            writeFileSync('out/results.json', JSON.stringify(result, null, 1));
+            for (const r of result) console.log(r.file, 'rc=' + r.rc, JSON.stringify(r.summary));"
+          cp toolchain.txt out/
+      - name: Upload Gate 2 results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: gate2-${{ matrix.side }}
+          path: out/
+          if-no-files-found: error
+
+  compare:
+    name: Gate 2 compare (identity, status, normalized error)
+    needs: matched
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: gate2-baseline
+          path: baseline
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: gate2-candidate
+          path: candidate
+      - name: Compare per test
+        run: |
+          cat > compare.mjs <<'EOF'
+          import { readFileSync, writeFileSync, appendFileSync } from "node:fs";
+          const load = (side) => JSON.parse(readFileSync(`${side}/results.json`, "utf8"));
+          const tool = (side) => readFileSync(`${side}/toolchain.txt`, "utf8").trim().split("\n");
+          const norm = (e) => e.split("\n").map((l) => l.trim()).filter(Boolean).slice(0, 3).join(" | ")
+            .replace(/\/home\/runner\/work\/[^\s'"`)]*/g, "<WS>").replace(/\/(private\/)?(tmp|var\/folders)\/[^\s'"`)]*/g, "<TMP>")
+            .replace(/\d{4}-\d\d-\d\dT[\d:.]+Z?/g, "<TS>").replace(/0x[0-9a-f]+|\b[0-9a-f]{12,}\b/gi, "<HEX>")
+            .replace(/\d+(\.\d+)?/g, "<N>").replace(/\s+/g, " ").slice(0, 160);
+          const [B, C] = [load("baseline"), load("candidate")];
+          const [tb, tc] = [tool("baseline"), tool("candidate")];
+          const rows = [];
+          const problems = [];
+          if (tb[0] !== tc[0] || tb[1] !== tc[1]) problems.push(`toolchain differs: ${tb} vs ${tc}`);
+          for (const bf of B) {
+            const cf = C.find((x) => x.file === bf.file);
+            if (!cf) { problems.push(`file missing in candidate: ${bf.file}`); continue; }
+            for (const [side, f] of [["baseline", bf], ["candidate", cf]]) {
+              if (!f.summary) problems.push(`${side} run incomplete (no TAP summary, rc=${f.rc}): ${f.file}`);
+              else if (f.summary.tests !== f.tests.length) problems.push(`${side} test count ${f.tests.length} != summary ${f.summary.tests}: ${f.file}`);
+            }
+            const ids = new Set([...bf.tests.map((t) => t.id), ...cf.tests.map((t) => t.id)]);
+            for (const id of ids) {
+              const b = bf.tests.find((t) => t.id === id);
+              const c = cf.tests.find((t) => t.id === id);
+              let cls;
+              if (!b || !c) cls = "IDENTITY-MISMATCH";
+              else if (b.status === "pass" && c.status === "pass") cls = "pass-both";
+              else if (b.status === c.status && norm(b.err) === norm(c.err)) cls = "PRE-EXISTING";
+              else if (b.status === c.status) cls = "ERROR-MISMATCH";
+              else if (b.status === "pass" || b.status === "skip") cls = "CANDIDATE-SPECIFIC";
+              else if (c.status === "pass") cls = "CANDIDATE-IMPROVED";
+              else cls = "STATUS-MISMATCH";
+              rows.push({ file: bf.file.replace("tests/unit/", ""), id, b: b?.status ?? "absent", c: c?.status ?? "absent",
+                cls, sig: norm((b?.err || c?.err) ?? ""), csig: c && b && norm(b.err) !== norm(c.err) ? norm(c.err) : "" });
+              if (!["pass-both", "PRE-EXISTING"].includes(cls)) problems.push(`${cls}: ${bf.file} :: ${id}`);
+            }
+          }
+          const count = (k) => rows.filter((r) => r.cls === k).length;
+          const perFile = B.map((bf) => { const cf = C.find((x) => x.file === bf.file) ?? {}; return `| ${bf.file.replace("tests/unit/", "")} | ${JSON.stringify(bf.summary)} rc=${bf.rc} | ${JSON.stringify(cf.summary)} rc=${cf.rc} |`; });
+          const md = [
+            `## Gate 2: matched baseline vs candidate`,
+            `baseline ${tb.join(" ")} — candidate ${tc.join(" ")}`,
+            ``,
+            `tests compared: ${rows.length}; pass-both: ${count("pass-both")}; PRE-EXISTING: ${count("PRE-EXISTING")}; CANDIDATE-SPECIFIC: ${count("CANDIDATE-SPECIFIC")}; CANDIDATE-IMPROVED: ${count("CANDIDATE-IMPROVED")}; ERROR-MISMATCH: ${count("ERROR-MISMATCH")}; STATUS-MISMATCH: ${count("STATUS-MISMATCH")}; IDENTITY-MISMATCH: ${count("IDENTITY-MISMATCH")}`,
+            ``, `| file | baseline summary | candidate summary |`, `|---|---|---|`, ...perFile,
+            ``, `| file | test | baseline | candidate | classification | normalized error |`, `|---|---|---|---|---|---|`,
+            ...rows.filter((r) => r.cls !== "pass-both").map((r) => `| ${r.file} | ${r.id.replace(/\|/g, "\\|")} | ${r.b} | ${r.c} | ${r.cls} | ${(r.sig + (r.csig ? " ⟂ " + r.csig : "")).replace(/\|/g, "\\|")} |`),
+            ``, problems.length ? `### Problems\n` + problems.map((p) => `- ${p}`).join("\n") : `### No problems: every non-passing test matches the baseline exactly.`,
+          ].join("\n");
+          writeFileSync("gate2-compare.md", md);
+          writeFileSync("gate2-compare.json", JSON.stringify({ rows, problems }, null, 1));
+          appendFileSync(process.env.GITHUB_STEP_SUMMARY, md + "\n");
+          console.log(md);
+          process.exit(problems.length ? 1 : 0);
+          EOF
+          node compare.mjs
+      - name: Upload comparison
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: gate2-compare
+          path: gate2-compare.*
+          if-no-files-found: warn
