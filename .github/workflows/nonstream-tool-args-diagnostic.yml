@@ -1,0 +1,386 @@
+# TEMPORARY diagnostic: why do some unit-test results go missing on Linux CI?
+# Lives only on test/nonstream-tool-args-linux-20261025. Runs the 13 affected files on
+# the frozen fix commit, individually and as one concurrent group, in four runner
+# variants (process vs no isolation x with vs without --test-force-exit), plus a
+# V8-coverage execution witness that records which test callbacks actually ran,
+# independently of the test reporter. Nothing outside these 13 files is executed.
+name: Nonstream Tool Args Result-Loss Diagnostic
+
+on:
+  push:
+    branches: [test/nonstream-tool-args-linux-20261025]
+
+concurrency:
+  group: nonstream-tool-args-diagnostic-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  FIX_SHA: 8fd2e261e2a069c637d9f4383cbed8fddc036647
+  CI_NODE_MAJOR: "24"
+  REPS: "20"
+  DISABLE_SQLITE_AUTO_BACKUP: "true"
+  NEXT_TELEMETRY_DISABLED: "1"
+  OMNIROUTE_SKIP_SYSTEM_TRUST: "1"
+  # Same literal test values as ci.yml test-unit (not repository secrets).
+  JWT_SECRET: ci-test-secret-with-sufficient-length-for-validation
+  API_KEY_SECRET: ci-test-api-key-secret-long
+  NODE_OPTIONS: --max-old-space-size=8192
+  DIAG_FILES: |
+    tests/unit/reasoning-cache.test.ts
+    tests/unit/specificity-rules.test.ts
+    tests/unit/path-literal-edges.test.ts
+    tests/unit/build/check-licenses.test.ts
+    tests/unit/plan3-p0.test.ts
+    tests/unit/streamingPiiTransform.test.ts
+    tests/unit/authz/classify.test.ts
+    tests/unit/muse-code-device-hardening-15869.test.ts
+    tests/unit/admission-verdict.test.mjs
+    tests/unit/translator-openai-to-gemini.test.ts
+    tests/unit/executor-claude-identity.test.ts
+    tests/unit/combo-task-aware.test.ts
+    tests/unit/claude-code-parity.test.ts
+  # TAP -> JSON: one record per test (suites excluded) plus the runner summary.
+  TAP_PARSER: |
+    import { readFileSync } from "node:fs";
+    const unesc = (s) => s.replace(/\\#/g, "#").replace(/\\\\/g, "\\");
+    export function parseTap(file) {
+      const lines = readFileSync(file, "utf8").split("\n");
+      const stack = [];
+      const tests = [];
+      const summary = {};
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        const sub = line.match(/^( *)# Subtest: (.*)$/);
+        if (sub) { const lvl = sub[1].length / 4; stack.length = lvl; stack[lvl] = unesc(sub[2]); continue; }
+        const sm = line.match(/^# (tests|suites|pass|fail|cancelled|skipped|todo|duration_ms) ([\d.]+)$/);
+        if (sm) { summary[sm[1]] = Number(sm[2]); continue; }
+        const r = line.match(/^( *)(ok|not ok) \d+ - (.*?)(?: # (SKIP|TODO)\b.*)?$/);
+        if (!r) continue;
+        const lvl = r[1].length / 4;
+        const name = unesc(r[3]);
+        const meta = {};
+        if ((lines[i + 1] ?? "").trim() === "---") {
+          const pad = r[1] + "  ";
+          let j = i + 2;
+          for (; j < lines.length && lines[j] !== pad + "..."; j++) {
+            const kv = lines[j].match(/^ *(type|failureType|error|code): ?(.*)$/);
+            if (!kv || !lines[j].startsWith(pad) || lines[j].startsWith(pad + " ")) continue;
+            let v = kv[2];
+            if (v === "|-" || v === "|" || v === ">-") {
+              const body = [];
+              while (j + 1 < lines.length && lines[j + 1].startsWith(pad + "  ")) body.push(lines[++j].trim());
+              v = body.join("\n");
+            } else v = v.replace(/^'(.*)'$/, "$1").replace(/''/g, "'");
+            meta[kv[1]] = v;
+          }
+          i = j;
+        }
+        if (meta.type === "suite") continue;
+        let status = r[2] === "ok" ? (r[4] ? r[4].toLowerCase() : "pass") : "fail";
+        if (status === "fail" && meta.failureType === "testTimeoutFailure") status = "timeout";
+        if (status === "fail" && meta.failureType === "cancelledByParent") status = "cancelled";
+        tests.push({ id: [...stack.slice(0, lvl), name].join(" > "), status, err: meta.error ?? "", code: meta.code ?? "" });
+      }
+      return { tests, summary: Object.keys(summary).length ? summary : null };
+    }
+  # Execution witness from raw V8 coverage: maps every function that ran in a test
+  # file back to its original source line through Node's source-map cache.
+  WITNESS: |
+    import { readFileSync, readdirSync } from "node:fs";
+    import { createRequire } from "node:module";
+    const require = createRequire(process.cwd() + "/");
+    const { TraceMap, originalPositionFor, GREATEST_LOWER_BOUND, LEAST_UPPER_BOUND } = require("@jridgewell/trace-mapping");
+    function offsetToPos(lineLengths, offset) {
+      let line = 0;
+      let rest = offset;
+      while (line < lineLengths.length && rest > lineLengths[line]) { rest -= lineLengths[line] + 1; line++; }
+      return { line: line + 1, column: Math.max(0, rest) };
+    }
+    export function executedLines(covDir, testFile) {
+      const lines = new Map();
+      let scripts = 0;
+      for (const name of readdirSync(covDir)) {
+        if (!name.endsWith(".json")) continue;
+        const cov = JSON.parse(readFileSync(`${covDir}/${name}`, "utf8"));
+        const cache = cov["source-map-cache"] ?? {};
+        for (const script of cov.result ?? []) {
+          if (!script.url.endsWith(testFile)) continue;
+          const entry = cache[script.url];
+          if (!entry?.data || !entry.lineLengths) continue;
+          scripts++;
+          const map = new TraceMap(entry.data);
+          for (const fn of script.functions) {
+            const range = fn.ranges[0];
+            const gen = offsetToPos(entry.lineLengths, range.startOffset);
+            let orig = originalPositionFor(map, { ...gen, bias: LEAST_UPPER_BOUND });
+            if (orig.line == null) orig = originalPositionFor(map, { ...gen, bias: GREATEST_LOWER_BOUND });
+            if (orig.line == null) continue;
+            lines.set(orig.line, Math.max(lines.get(orig.line) ?? 0, range.count));
+          }
+        }
+      }
+      return { lines, scripts };
+    }
+
+jobs:
+  diag:
+    name: Diagnostic (${{ matrix.variant }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 80
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: process-force-exit
+            flags: --test-force-exit
+            coverage: "false"
+          - variant: process-no-force-exit
+            flags: ""
+            coverage: "false"
+          - variant: none-force-exit
+            flags: --test-isolation=none --test-force-exit
+            coverage: "false"
+          - variant: none-no-force-exit
+            flags: --test-isolation=none
+            coverage: "false"
+          - variant: process-force-exit-coverage-witness
+            flags: --test-force-exit
+            coverage: "true"
+    env:
+      FLAGS: ${{ matrix.flags }}
+      COVERAGE: ${{ matrix.coverage }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.FIX_SHA }}
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.CI_NODE_MAJOR }}
+          package-manager-cache: false
+      - uses: ./.github/actions/npm-ci-retry
+        with:
+          cache: "false"
+      - name: Gate 0 - toolchain and isolation
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$FIX_SHA"
+          test "${{ runner.environment }}" = "github-hosted"
+          node -v; npm -v
+          test "$(node -p 'process.versions.node.split(".")[0]')" = "$CI_NODE_MAJOR"
+          test "$(npm -v)" = "$(node -p "require('./config/ci/toolchain.json').npm")"
+          test -z "${DATA_DIR+x}" && test -z "${OMNIROUTE_ALLOW_DEFAULT_DATA_DIR+x}"
+          npm run check:node-runtime
+          node --help | grep -E -- '--test-isolation|--test-force-exit'
+          { echo "node=$(node -v)"; echo "npm=$(npm -v)"; echo "sha=$(git rev-parse HEAD)"; echo "variant=${{ matrix.variant }}"; echo "flags=$FLAGS"; } > toolchain.txt
+      - name: Write helper modules
+        run: |
+          printf '%s' "$TAP_PARSER" > "$RUNNER_TEMP/tap.mjs"
+          printf '%s' "$WITNESS" > "$RUNNER_TEMP/witness.mjs"
+          # Keep only test-file scripts in raw coverage (drops the bulk, keeps the evidence).
+          cat > "$RUNNER_TEMP/slimcov.mjs" <<'EOF'
+          import { readdirSync, readFileSync, writeFileSync } from "node:fs";
+          const dir = process.argv[2];
+          for (const n of readdirSync(dir)) {
+            if (!n.endsWith(".json")) continue;
+            const j = JSON.parse(readFileSync(`${dir}/${n}`, "utf8"));
+            const result = (j.result ?? []).filter((s) => s.url.includes("/tests/unit/"));
+            const cache = {};
+            for (const s of result) if (j["source-map-cache"]?.[s.url]) cache[s.url] = j["source-map-cache"][s.url];
+            writeFileSync(`${dir}/${n}`, JSON.stringify({ result, "source-map-cache": cache }));
+          }
+          EOF
+      - name: Run the 13 files individually and as one group (bounded)
+        run: |
+          set -u
+          mkdir -p out/tap out/cov
+          printf '%s\n' "$DIAG_FILES" | sed -e 's/^ *//' -e '/^$/d' > out/files.lst
+          test "$(wc -l < out/files.lst)" -eq 13
+          cp toolchain.txt out/
+          BASE="node --import tsx/esm --import ./open-sse/utils/setupPolyfill.ts --import ./tests/_setup/isolateDataDir.ts --test --test-reporter=tap"
+          LAST_RC=0
+          run() { # mode tag limit concurrency files...
+            local mode="$1" tag="$2" lim="$3" conc="$4"; shift 4
+            local covenv=()
+            if [ "$COVERAGE" = "true" ]; then mkdir -p "out/cov/$tag"; covenv=("NODE_V8_COVERAGE=$PWD/out/cov/$tag"); fi
+            local t0; t0=$(date +%s%N)
+            set +e
+            env ${covenv[@]+"${covenv[@]}"} timeout -k 10 "$lim" $BASE $FLAGS --test-concurrency="$conc" "$@" > "out/tap/$tag.tap" 2> "out/tap/$tag.stderr" < /dev/null
+            LAST_RC=$?
+            set -e
+            printf '%s\t%s\t%s\t%s\t%s\n' "$mode" "$tag" "$LAST_RC" "$(( ($(date +%s%N) - t0) / 1000000 ))" "$*" >> out/manifest.tsv
+            if [ "$COVERAGE" = "true" ]; then node "$RUNNER_TEMP/slimcov.mjs" "out/cov/$tag"; fi
+          }
+          for rep in $(seq 1 "$REPS"); do
+            while read -r f; do
+              slug=$(echo "$f" | sed 's#^tests/unit/##; s#/#__#g; s#\.test\.[a-z]*$##')
+              [ -e "out/skip.$slug" ] && continue
+              run single "single.$slug.r$rep" 180 1 "$f"
+              if [ "$LAST_RC" = 124 ] || [ "$LAST_RC" = 137 ]; then touch "out/skip.$slug"; echo "::warning::timeout $f rep $rep; later reps skipped"; fi
+            done < out/files.lst
+            if [ ! -e out/skip.group ]; then
+              run group "group.r$rep" 900 4 $(cat out/files.lst)
+              if [ "$LAST_RC" = 124 ] || [ "$LAST_RC" = 137 ]; then touch out/skip.group; echo "::warning::group timeout rep $rep; later reps skipped"; fi
+            fi
+            echo "rep $rep done"
+          done
+          wc -l out/manifest.tsv
+      - name: Parse runs (and coverage witness)
+        run: |
+          node --input-type=module -e "
+            import { readFileSync, writeFileSync } from 'node:fs';
+            const { parseTap } = await import('$RUNNER_TEMP/tap.mjs');
+            const { executedLines } = await import('$RUNNER_TEMP/witness.mjs');
+            const cov = process.env.COVERAGE === 'true';
+            const runs = readFileSync('out/manifest.tsv', 'utf8').trim().split('\n').map((l) => {
+              const [mode, tag, rc, ms, files] = l.split('\t');
+              const { tests, summary } = parseTap('out/tap/' + tag + '.tap');
+              const run = { mode, tag, rc: Number(rc), ms: Number(ms), files: files.split(' '), summary,
+                tests: tests.map((t) => ({ id: t.id, status: t.status, err: t.err.split('\n')[0].slice(0, 200) })) };
+              if (cov) run.witness = Object.fromEntries(run.files.map((f) => {
+                const { lines, scripts } = executedLines('out/cov/' + tag, f);
+                return [f, { scripts, lines: [...lines.entries()] }];
+              }));
+              return run;
+            });
+            writeFileSync('out/results.json', JSON.stringify(runs));
+            const bad = runs.filter((r) => !r.summary);
+            console.log('runs', runs.length, 'without TAP summary', bad.length);
+            for (const r of runs.filter((x) => x.mode === 'group').slice(0, 3)) console.log(r.tag, 'rc=' + r.rc, JSON.stringify(r.summary));"
+      - name: Upload diagnostic results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: diag-${{ matrix.variant }}
+          path: out/
+          if-no-files-found: error
+
+  report:
+    name: Diagnostic report (identity reconciliation)
+    needs: diag
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.FIX_SHA }}
+          persist-credentials: false
+          sparse-checkout: tests/unit
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: diag-*
+          path: diag
+      - name: Reconcile expected, reported and executed tests
+        run: |
+          cat > analyze.mjs <<'EOF'
+          import { readFileSync, existsSync, writeFileSync, appendFileSync } from "node:fs";
+          const VARIANTS = ["process-force-exit", "process-no-force-exit", "none-force-exit", "none-no-force-exit", "process-force-exit-coverage-witness"];
+          const files = readFileSync("diag/diag-process-no-force-exit/files.lst", "utf8").trim().split("\n");
+          const infra = [];
+          const data = {};
+          for (const v of VARIANTS) {
+            const p = `diag/diag-${v}/results.json`;
+            if (!existsSync(p)) { infra.push(`variant ${v}: no results artifact`); continue; }
+            data[v] = JSON.parse(readFileSync(p, "utf8"));
+          }
+          // Expected identities per file: process isolation WITHOUT --test-force-exit, single-file
+          // runs, every repetition complete (summary present, no timeout) and identical.
+          const expected = {};
+          const expectedNote = {};
+          for (const f of files) {
+            const runs = (data["process-no-force-exit"] ?? []).filter((r) => r.mode === "single" && r.files[0] === f);
+            const good = runs.filter((r) => r.summary && r.rc !== 124 && r.rc !== 137);
+            const sets = good.map((r) => JSON.stringify(r.tests.map((t) => t.id)));
+            const uniq = [...new Set(sets)];
+            if (!good.length) { expectedNote[f] = "NO COMPLETE REFERENCE RUN"; expected[f] = []; continue; }
+            expected[f] = JSON.parse(uniq.sort((a, b) => b.length - a.length)[0]);
+            expectedNote[f] = uniq.length === 1 ? `stable over ${good.length} runs` : `UNSTABLE: ${uniq.length} distinct id lists over ${good.length} runs`;
+            // Cross-check with no-isolation, no-force-exit single runs.
+            const alt = (data["none-no-force-exit"] ?? []).filter((r) => r.mode === "single" && r.files[0] === f && r.summary).map((r) => JSON.stringify(r.tests.map((t) => t.id)));
+            const altU = [...new Set(alt)];
+            expectedNote[f] += altU.length === 1 && altU[0] === uniq[0] ? "; identical under --test-isolation=none" : `; isolation=none differs (${altU.length} variants)`;
+          }
+          const fileOf = new Map();
+          for (const f of files) for (const id of expected[f]) fileOf.set(id, fileOf.has(id) && fileOf.get(id) !== f ? "AMBIGUOUS" : f);
+          const srcOf = (f) => readFileSync(f, "utf8");
+          const titleLines = (src, title) => { const out = []; src.split("\n").forEach((l, i) => { for (const q of ['"', "'", "`"]) if (l.includes(q + title + q)) { out.push(i + 1); break; } }); return out; };
+          const witnessAt = (lines, L) => { for (let l = L; l <= L + 3; l++) if (lines.has(l)) return lines.get(l) > 0 ? "executed" : "not-executed"; return "no-function-found"; };
+          const rows = [], perFile = [], failures = [];
+          const witnessTally = { executed: 0, "not-executed": 0, unverifiable: 0, "no-function-found": 0, "no-coverage-data": 0 };
+          const controlTally = { executed: 0, other: 0 };
+          let tailLossRuns = 0, lossRuns = 0;
+          for (const v of VARIANTS) {
+            if (!data[v]) continue;
+            for (const mode of ["single", "group"]) {
+              const runs = data[v].filter((r) => r.mode === mode);
+              let lossy = 0, missingTotal = 0, timeouts = 0, noSummary = 0, rcNonZeroLossy = 0;
+              for (const r of runs) {
+                if (r.rc === 124 || r.rc === 137) timeouts++;
+                if (!r.summary) noSummary++;
+                const reported = new Set(r.tests.map((t) => t.id));
+                for (const t of r.tests) if (t.status !== "pass" && t.status !== "skip" && t.status !== "todo") failures.push(`${v} ${r.tag}: ${t.status} ${t.id} | ${t.err}`);
+                let runMissing = 0;
+                for (const f of r.files) {
+                  const exp = expected[f] ?? [];
+                  const miss = exp.filter((id) => !reported.has(id));
+                  if (!miss.length) continue;
+                  runMissing += miss.length;
+                  const idx = miss.map((id) => exp.indexOf(id));
+                  const lastReported = Math.max(-1, ...exp.map((id, i) => (reported.has(id) ? i : -1)));
+                  const tail = idx.every((i) => i > lastReported);
+                  if (tail) tailLossRuns++;
+                  lossRuns++;
+                  perFile.push({ v, mode, tag: r.tag, f, expected: exp.length, reported: exp.length - miss.length, missing: miss.length, tail, rc: r.rc });
+                  if (r.witness) {
+                    const w = r.witness[f];
+                    const lines = new Map(w?.lines ?? []);
+                    const src = srcOf(f);
+                    if (!w || !w.scripts) { witnessTally["no-coverage-data"] += miss.length; continue; }
+                    for (const id of miss) { const tl = titleLines(src, id.split(" > ").pop()); witnessTally[tl.length === 1 ? witnessAt(lines, tl[0]) : "unverifiable"]++; }
+                    for (const id of exp.filter((x) => reported.has(x))) { const tl = titleLines(src, id.split(" > ").pop()); if (tl.length === 1) controlTally[witnessAt(lines, tl[0]) === "executed" ? "executed" : "other"]++; }
+                  }
+                }
+                if (runMissing) { lossy++; missingTotal += runMissing; if (r.rc !== 0) rcNonZeroLossy++; }
+              }
+              rows.push(`| ${v} | ${mode} | ${runs.length} | ${lossy} | ${missingTotal} | ${rcNonZeroLossy} | ${timeouts} | ${noSummary} |`);
+            }
+          }
+          const fileRows = files.map((f) => {
+            const cells = VARIANTS.map((v) => {
+              const fr = perFile.filter((p) => p.v === v && p.f === f);
+              const runs = (data[v] ?? []).filter((r) => r.files.includes(f)).length;
+              return `${fr.length}/${runs}` + (fr.length ? ` (−${Math.min(...fr.map((p) => p.missing))}…−${Math.max(...fr.map((p) => p.missing))})` : "");
+            });
+            return `| ${f.replace("tests/unit/", "")} | ${expected[f].length} | ${expectedNote[f]} | ${cells.join(" | ")} |`;
+          });
+          const md = [
+            `## Result-loss diagnostic (fix commit, 13 files, ${process.env.REPS} repetitions)`,
+            ``, `### Runs per variant`,
+            `| variant | mode | runs | runs with missing results | missing results | lossy runs with rc≠0 | timeouts | runs without TAP summary |`,
+            `|---|---|---|---|---|---|---|---|`, ...rows,
+            ``, `### Per file: lossy runs / runs containing the file (min…max missing)`,
+            `| file | expected tests | expected-set evidence | ${VARIANTS.join(" | ")} |`, `|---|---|---|${VARIANTS.map(() => "---").join("|")}|`, ...fileRows,
+            ``, `Lossy file-runs where every missing test comes after the last reported one (tail loss): ${tailLossRuns} of ${lossRuns}`,
+            ``, `### Execution witness (V8 coverage, process isolation + --test-force-exit)`,
+            `Missing results: ${JSON.stringify(witnessTally)}`,
+            `Positive control (reported tests in the same lossy runs): ${JSON.stringify(controlTally)}`,
+            ``, `### Non-passing test results (${failures.length})`, ...failures.slice(0, 60).map((x) => `- ${x}`),
+            ``, `### Infrastructure (${infra.length})`, ...infra.map((x) => `- ${x}`),
+          ].join("\n");
+          writeFileSync("diagnostic-report.md", md);
+          writeFileSync("diagnostic-report.json", JSON.stringify({ expected: Object.fromEntries(files.map((f) => [f, expected[f].length])), expectedNote, perFile, witnessTally, controlTally, failures, infra, tailLossRuns, lossRuns }, null, 1));
+          appendFileSync(process.env.GITHUB_STEP_SUMMARY, md + "\n");
+          console.log(md);
+          EOF
+          node analyze.mjs
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: diagnostic-report
+          path: diagnostic-report.*
+          if-no-files-found: warn

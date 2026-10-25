@@ -5,9 +5,13 @@
 # 3 full Linux unit suite (8 shards) + Vitest MCP + Vitest UI on the fix commit.
 name: Nonstream Tool Args Linux Validation
 
+# Parked while the result-loss diagnostic runs: a workflow_dispatch-only workflow that is
+# not on the default branch cannot start, so pushes to this branch no longer run Gates 0-3.
+# Restore the push trigger below to re-run the validation.
+#   push:
+#     branches: [test/nonstream-tool-args-linux-20261025]
 on:
-  push:
-    branches: [test/nonstream-tool-args-linux-20261025]
+  workflow_dispatch:
 
 concurrency:
   group: nonstream-tool-args-linux-${{ github.ref }}
@@ -530,7 +534,10 @@ jobs:
             rc=$?
             set -e
             printf '%s\t%s\t%s\n' "$i" "$rc" "$(( $(date +%s) - start ))" >> out/stages.tsv
-            grep -E '^ℹ (tests|suites|pass|fail|cancelled|skipped|todo|duration_ms) ' "out/stage$i.log" | tail -8 > "out/stage$i.summary" || true
+            # -a: test output can contain NUL bytes; without it GNU grep prints only
+            # "binary file matches" and the stage summary silently comes out empty.
+            grep -aE '^ℹ (tests|suites|pass|fail|cancelled|skipped|todo|duration_ms) ' "out/stage$i.log" | tail -8 > "out/stage$i.summary" || true
+            [ -s "out/stage$i.summary" ] || echo "::error::stage $i produced no runner summary"
             echo "::group::stage $i rc=$rc ($(( $(date +%s) - start ))s)"
             cat "out/stage$i.summary"
             awk '/failing tests:/{f=1} f' "out/stage$i.log" | grep -vE '^\s+at ' | head -400
@@ -540,6 +547,7 @@ jobs:
       - name: Shard verdict
         run: |
           cat out/stages.tsv
+          for i in 1 2 3; do [ -s "out/stage$i.summary" ] || { echo "stage $i: missing runner summary"; exit 1; }; done
           awk -F'\t' '$2 != 0 {bad=1} END {exit bad}' out/stages.tsv
       - name: Upload shard logs
         if: always()
