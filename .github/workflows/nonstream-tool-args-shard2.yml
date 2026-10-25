@@ -1,0 +1,473 @@
+# TEMPORARY final Shard 2 investigation and recovery on the frozen fix commit.
+# Lives only on test/nonstream-tool-args-linux-20261025.
+# Job "investigate": tests/unit/proxy-health-recovery-plan.test.ts alone, as in Phase A
+#   (run 40188448796): bounded plain and instrumented runs without --test-force-exit, five
+#   force-exit runs, an in-process attempt and its literal titles. It writes a verdict: is it a
+#   blocker (all tests finish, the process does not terminate), and the exact expected set.
+# Job "recover" runs only if that verdict verifies the blocker: Shard 2 stage 1 exactly as in
+#   Phase B (run 40189763018), with two named, individually verified exceptions. If the main
+#   run still does not terminate, the file Node reports at the head of the interrupted list
+#   is diagnosed the same way; no further exception is added.
+name: Nonstream Tool Args Final Shard 2
+
+on:
+  push:
+    branches: [test/nonstream-tool-args-linux-20261025]
+
+concurrency:
+  group: nonstream-tool-args-shard2-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  FIX_SHA: 8fd2e261e2a069c637d9f4383cbed8fddc036647
+  CI_NODE_MAJOR: "24"
+  SHARD: "2"
+  SUSPECT: tests/unit/proxy-health-recovery-plan.test.ts
+  PRIOR_EXCEPTION: tests/unit/daily-reset-tz-threading.test.ts
+  DISABLE_SQLITE_AUTO_BACKUP: "true"
+  NEXT_TELEMETRY_DISABLED: "1"
+  OMNIROUTE_SKIP_SYSTEM_TRUST: "1"
+  # Same literal test values as ci.yml test-unit (not repository secrets).
+  JWT_SECRET: ci-test-secret-with-sufficient-length-for-validation
+  API_KEY_SECRET: ci-test-api-key-secret-long
+  NODE_OPTIONS: --max-old-space-size=8192
+  # daily-reset-tz-threading: identical across 7 runs of 40188448796 and accepted in 40189763018.
+  PRIOR_EXPECTED: |
+    [{"id":"checkFallbackError: Paris pre-spring-forward resolves to provider midnight","status":"pass"},{"id":"checkFallbackError: Paris pre-fall-back resolves to provider midnight","status":"pass"},{"id":"checkFallbackError: New York resolves to provider midnight, not host midnight","status":"pass"},{"id":"checkFallbackError: unconfigured clock keeps the legacy host-midnight value","status":"pass"},{"id":"checkFallbackError: invalid timezone falls back to legacy without throwing","status":"pass"},{"id":"resolveComboDailyReset: matches id and prefix, null for unknown providers","status":"pass"},{"id":"round-robin combo passes the node clock, and a timezone edit applies without restart","status":"pass"},{"id":"priority combo attempt path passes the node clock to checkFallbackError","status":"pass"}]
+  HANDLES_PRELOAD: |
+    import { appendFileSync, mkdirSync } from "node:fs";
+    const dir = process.env.HANGDIAG_DIR;
+    if (dir) {
+      mkdirSync(dir, { recursive: true });
+      const testFile = process.argv.slice(1).find((a) => /\.test\.(ts|mjs|js)$/.test(a)) ?? "";
+      const role = process.env.NODE_TEST_CONTEXT ? `child:${testFile.replace(/^.*?(tests\/unit\/)/, "$1")}` : "runner";
+      const timers = new Map();
+      const site = () => (new Error().stack ?? "").split("\n").slice(2).map((s) => s.trim())
+        .filter((s) => !s.includes("node:internal") && !s.includes("hangdiag-preload")).slice(0, 4).join(" <- ");
+      const keep = (wrapper, orig) => { for (const k of Reflect.ownKeys(orig)) { if (!(k in wrapper) || typeof k === "symbol") { try { Object.defineProperty(wrapper, k, Object.getOwnPropertyDescriptor(orig, k)); } catch {} } } return wrapper; };
+      const oSI = globalThis.setInterval, oST = globalThis.setTimeout, oCI = globalThis.clearInterval, oCT = globalThis.clearTimeout;
+      globalThis.setInterval = keep(function setInterval(fn, ms, ...a) { const t = oSI(fn, ms, ...a); timers.set(t, { kind: "interval", ms, site: site() }); return t; }, oSI);
+      globalThis.setTimeout = keep(function setTimeout(fn, ms, ...a) {
+        let t; const run = typeof fn === "function" ? function (...x) { timers.delete(t); return fn.apply(this, x); } : fn;
+        t = oST(run, ms, ...a); if ((ms ?? 0) >= 1000) timers.set(t, { kind: "timeout", ms, site: site() }); return t;
+      }, oST);
+      globalThis.clearInterval = keep(function clearInterval(t) { timers.delete(t); return oCI(t); }, oCI);
+      globalThis.clearTimeout = keep(function clearTimeout(t) { timers.delete(t); return oCT(t); }, oCT);
+      const describe = (h) => {
+        const type = h?.constructor?.name ?? typeof h; const d = { type };
+        try {
+          if (type === "Socket" || type === "TLSSocket") Object.assign(d, { remote: `${h.remoteAddress ?? h._host ?? "?"}:${h.remotePort ?? "?"}`, local: h.localPort, connecting: h.connecting, destroyed: h.destroyed, fd: h._handle?.fd });
+          else if (type === "Server") d.address = h.address?.();
+          else if (type === "ChildProcess") Object.assign(d, { pid: h.pid, file: h.spawnfile, args: (h.spawnargs ?? []).slice(1, 6) });
+        } catch {}
+        return d;
+      };
+      const dump = (why) => { try { appendFileSync(`${dir}/${process.pid}.jsonl`, JSON.stringify({ t: Date.now(), why, pid: process.pid, ppid: process.ppid, role,
+        resources: process.getActiveResourcesInfo(), handles: process._getActiveHandles().map(describe),
+        timers: [...timers.entries()].filter(([t]) => typeof t?.hasRef !== "function" || t.hasRef()).map(([, v]) => v) }) + "\n"); } catch {} };
+      oSI(() => dump("periodic"), 10000).unref();
+      process.on("exit", () => dump("exit"));
+      dump("start");
+    }
+  TAP_PARSER: |
+    import { readFileSync } from "node:fs";
+    const unesc = (s) => s.replace(/\\#/g, "#").replace(/\\\\/g, "\\");
+    export function parseTap(file) {
+      const lines = readFileSync(file, "utf8").split("\n");
+      const stack = [];
+      const tests = [];
+      const started = [];
+      const summary = {};
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        const sub = line.match(/^( *)# Subtest: (.*)$/);
+        if (sub) { const lvl = sub[1].length / 4; stack.length = lvl; stack[lvl] = unesc(sub[2]); started.push([...stack].join(" > ")); continue; }
+        const sm = line.match(/^# (tests|suites|pass|fail|cancelled|skipped|todo|duration_ms) ([\d.]+)$/);
+        if (sm) { summary[sm[1]] = Number(sm[2]); continue; }
+        const r = line.match(/^( *)(ok|not ok) \d+ - (.*?)(?: # (SKIP|TODO)\b.*)?$/);
+        if (!r) continue;
+        const lvl = r[1].length / 4;
+        const name = unesc(r[3]);
+        const meta = {};
+        if ((lines[i + 1] ?? "").trim() === "---") {
+          const pad = r[1] + "  ";
+          let j = i + 2;
+          for (; j < lines.length && lines[j] !== pad + "..."; j++) {
+            const kv = lines[j].match(/^ *(type|failureType|error|code): ?(.*)$/);
+            if (!kv || !lines[j].startsWith(pad) || lines[j].startsWith(pad + " ")) continue;
+            let v = kv[2];
+            if (v === "|-" || v === "|" || v === ">-") {
+              const body = [];
+              while (j + 1 < lines.length && lines[j + 1].startsWith(pad + "  ")) body.push(lines[++j].trim());
+              v = body.join("\n");
+            } else v = v.replace(/^'(.*)'$/, "$1").replace(/''/g, "'");
+            meta[kv[1]] = v;
+          }
+          i = j;
+        }
+        const id = [...stack.slice(0, lvl), name].join(" > ");
+        const done = started.lastIndexOf(id); if (done >= 0) started.splice(done, 1);
+        if (meta.type === "suite") continue;
+        let status = r[2] === "ok" ? (r[4] ? r[4].toLowerCase() : "pass") : "fail";
+        if (status === "fail" && meta.failureType === "testTimeoutFailure") status = "timeout";
+        if (status === "fail" && meta.failureType === "cancelledByParent") status = "cancelled";
+        tests.push({ id, status, err: (meta.error ?? "").split("\n")[0].slice(0, 200) });
+      }
+      return { tests, summary: Object.keys(summary).length ? summary : null, unfinished: started };
+    }
+  JUNIT_PARSER: |
+    import { readFileSync } from "node:fs";
+    const unx = (s) => s.replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
+      .replace(/&#x([0-9a-f]+);/gi, (_, h) => String.fromCodePoint(parseInt(h, 16))).replace(/&#(\d+);/g, (_, d) => String.fromCodePoint(Number(d))).replace(/&amp;/g, "&");
+    export function parseJunit(file, root) {
+      const xml = readFileSync(file, "utf8");
+      const tests = [];
+      const stack = [];
+      let suites = 0;
+      let cur = null;
+      const re = /<(\/?)(testsuites|testsuite|testcase|failure|skipped|error)\b((?:[^>"]|"[^"]*")*?)(\/?)>/g;
+      for (const m of xml.matchAll(re)) {
+        const [, close, tag, attrStr, selfClose] = m;
+        const attrs = {};
+        for (const a of attrStr.matchAll(/([\w:-]+)="([^"]*)"/g)) attrs[a[1]] = unx(a[2]);
+        if (tag === "testsuite") { if (!close) suites++; if (close) stack.pop(); else if (!selfClose) stack.push(attrs.name ?? ""); continue; }
+        if (tag === "testcase") {
+          if (close) { cur = null; continue; }
+          cur = { file: (attrs.file ?? "").split(root).pop().replace(/^\/+/, ""), id: [...stack, attrs.name ?? ""].join(" > "), status: "pass", err: "" };
+          tests.push(cur);
+          if (selfClose) cur = null;
+          continue;
+        }
+        if (!cur || close) continue;
+        if (tag === "skipped") cur.status = attrs.type === "todo" ? "todo" : "skip";
+        if (tag === "failure" || tag === "error") {
+          const t = attrs.type ?? "";
+          cur.status = /testTimeoutFailure/.test(t) ? "timeout" : /cancelledByParent/.test(t) ? "cancelled" : "fail";
+          cur.err = (attrs.message ?? "").split("\n")[0].slice(0, 200);
+        }
+      }
+      return { tests, suites };
+    }
+  # Bounded runner with process/socket/output sampling; steps run under `bash -e`, and
+  # timeouts (124) and test failures are expected outcomes here.
+  RUN_LIB: |
+    set +e
+    BASE_IMPORTS="--import tsx/esm --import ./open-sse/utils/setupPolyfill.ts --import ./tests/_setup/isolateDataDir.ts"
+    sample() {
+      local d=$1 root=$2
+      while kill -0 "$root" 2>/dev/null; do
+        local pids
+        pids=$(ps -eo pid=,ppid= | awk -v r="$root" '{p[$1]=$2} END {a[r]=1; c=1; while (c) {c=0; for (k in p) if (!(k in a) && (p[k] in a)) {a[k]=1; c=1}} for (k in a) print k}' | tr '\n' ' ')
+        {
+          echo "=== t=$(date +%s) tap_lines=$(wc -l < "$d/out.tap") stderr_lines=$(wc -l < "$d/err.txt")"
+          ps -o pid=,ppid=,etimes=,stat=,args= -p "$(echo $pids | tr ' ' ',')" 2>/dev/null | cut -c1-240
+          ss -tanpH 2>/dev/null | grep -E "pid=($(echo $pids | tr ' ' '|'))," | cut -c1-200 || true
+        } >> "$d/samples.txt"
+        sleep 10
+      done
+    }
+    run() { # dir name limit instrumented(0|1) runner-flags... files...
+      local base=$1 name=$2 lim=$3 inst=$4; shift 4
+      local d="$base/$name"; mkdir -p "$d"; : > "$d/out.tap"; : > "$d/err.txt"
+      local pre=() envv=()
+      if [ "$inst" = 1 ]; then pre=(--import "$RUNNER_TEMP/hangdiag-preload.mjs"); envv=("HANGDIAG_DIR=$PWD/$d/handles"); fi
+      local t0; t0=$(date +%s)
+      env ${envv[@]+"${envv[@]}"} timeout -k 15 "$lim" node ${pre[@]+"${pre[@]}"} $BASE_IMPORTS --test --test-reporter=tap "$@" > "$d/out.tap" 2> "$d/err.txt" < /dev/null &
+      local tp=$!
+      sample "$d" "$tp" & local sp=$!
+      local rc=0; wait "$tp" || rc=$?
+      kill "$sp" 2>/dev/null; wait "$sp" 2>/dev/null
+      printf '%s\t%s\t%s\n' "$name" "$rc" "$(( $(date +%s) - t0 ))" | tee -a "$base/manifest.tsv"
+    }
+    investigate() { # base file : the Phase A evidence set for one file
+      local base=$1 f=$2; mkdir -p "$base"
+      run "$base" plain 240 0 --test-concurrency=1 "$f"
+      run "$base" instrumented 240 1 --test-concurrency=1 "$f"
+      for i in 1 2 3; do run "$base" "inproc-force-$i" 180 0 --test-isolation=none --test-force-exit --test-concurrency=1 "$f"; done
+      for i in 1 2 3 4 5; do run "$base" "proc-force-$i" 180 0 --test-force-exit --test-concurrency=1 "$f"; done
+      node "$RUNNER_TEMP/verdict.mjs" "$base" "$f"
+    }
+  # Verdict for one investigated file: blocker iff the no-force-exit runs time out with every
+  # expected test reported and none unfinished; expected = identities+statuses on which the
+  # plain, instrumented and 5 force-exit runs all agree, matching the literal title count.
+  VERDICT: |
+    import { readFileSync, readdirSync, existsSync, writeFileSync } from "node:fs";
+    const { parseTap } = await import(`${process.env.RUNNER_TEMP}/tap.mjs`);
+    const [base, file] = process.argv.slice(2);
+    const manifest = Object.fromEntries(readFileSync(`${base}/manifest.tsv`, "utf8").trim().split("\n").map((l) => { const [n, rc, s] = l.split("\t"); return [n, { rc: Number(rc), secs: Number(s) }]; }));
+    const runs = Object.fromEntries(Object.keys(manifest).map((n) => [n, parseTap(`${base}/${n}/out.tap`)]));
+    const key = (p) => JSON.stringify(p.tests.map((t) => [t.id, t.status]));
+    const agreeing = ["plain", "instrumented", "proc-force-1", "proc-force-2", "proc-force-3", "proc-force-4", "proc-force-5"];
+    const keys = new Set(agreeing.map((n) => key(runs[n])));
+    const src = readFileSync(file, "utf8");
+    const literal = [...src.matchAll(/^\s*(?:test|it)(?:\.skip|\.todo)?\(\s*(["'`])(.*?)\1/gm)].map((m) => m[2]).filter((t) => !t.includes("${"));
+    const loops = /^\s*for \(|\.forEach\(/m.test(src);
+    const expected = runs["proc-force-1"].tests.map((t) => ({ id: t.id, status: t.status }));
+    const forceOk = [1, 2, 3, 4, 5].every((i) => manifest[`proc-force-${i}`].rc === 0 && runs[`proc-force-${i}`].summary);
+    const timedOut = ["plain", "instrumented"].every((n) => manifest[n].rc === 124 || manifest[n].rc === 137);
+    const noUnfinished = ["plain", "instrumented"].every((n) => runs[n].unfinished.length === 0);
+    const literalMatches = loops || literal.length === expected.length;
+    const handles = [];
+    const hd = `${base}/instrumented/handles`;
+    if (existsSync(hd)) for (const h of readdirSync(hd)) {
+      const dumps = readFileSync(`${hd}/${h}`, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+      const last = dumps.filter((x) => x.why === "periodic").at(-1) ?? dumps.at(-1);
+      if (!last.role.startsWith("child")) continue;
+      handles.push({ role: last.role, dumps: dumps.length, resources: last.resources.reduce((m, r) => ((m[r] = (m[r] ?? 0) + 1), m), {}), handleTypes: last.handles.map((x) => x.type), timers: last.timers.slice(0, 8) });
+    }
+    const inproc = [1, 2, 3].map((i) => runs[`inproc-force-${i}`]);
+    const inprocUsable = inproc.every((p) => p.summary && !p.tests.some((t) => /must be a file URL/.test(t.err)));
+    const v = {
+      file, blocker: timedOut && noUnfinished && keys.size === 1 && forceOk && literalMatches,
+      runsAgree: keys.size === 1, forceExitRunsComplete: forceOk, noForceExitTimedOut: timedOut, unfinishedSubtests: noUnfinished ? 0 : runs.plain.unfinished,
+      literalTitles: literal.length, generatedTitlesPossible: loops, expected,
+      inProcess: inprocUsable ? { usable: true, sameAsExpected: inproc.every((p) => key(p) === key(runs["proc-force-1"])) } : { usable: false, error: inproc[0].tests[0]?.err ?? "" },
+      manifest, handles,
+    };
+    writeFileSync(`${base}/verdict.json`, JSON.stringify(v, null, 1));
+    console.log(JSON.stringify({ file, blocker: v.blocker, runsAgree: v.runsAgree, expected: expected.length, literalTitles: literal.length, timedOut, noUnfinished, forceOk, inProcess: v.inProcess }));
+    for (const h of handles) console.log("  ", h.role, JSON.stringify(h.resources), JSON.stringify(h.timers.map((t) => `${t.kind} ${t.ms}ms @ ${t.site.slice(0, 160)}`)));
+
+jobs:
+  investigate:
+    name: Investigate proxy-health-recovery-plan (no force-exit, instrumented, references)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.FIX_SHA }}
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.CI_NODE_MAJOR }}
+          package-manager-cache: false
+      - uses: ./.github/actions/npm-ci-retry
+        with:
+          cache: "false"
+      - name: Gate 0 - toolchain and isolation
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$FIX_SHA"
+          test "${{ runner.environment }}" = "github-hosted"
+          node -v; npm -v
+          test "$(node -p 'process.versions.node.split(".")[0]')" = "$CI_NODE_MAJOR"
+          test "$(npm -v)" = "$(node -p "require('./config/ci/toolchain.json').npm")"
+          test -z "${DATA_DIR+x}" && test -z "${OMNIROUTE_ALLOW_DEFAULT_DATA_DIR+x}"
+          npm run check:node-runtime
+          mkdir -p out
+          { echo "node=$(node -v)"; echo "npm=$(npm -v)"; echo "sha=$(git rev-parse HEAD)"; echo "file=$SUSPECT"; } > out/toolchain.txt
+      - name: Write helpers
+        run: |
+          printf '%s' "$HANDLES_PRELOAD" > "$RUNNER_TEMP/hangdiag-preload.mjs"
+          printf '%s' "$TAP_PARSER" > "$RUNNER_TEMP/tap.mjs"
+          printf '%s' "$RUN_LIB" > "$RUNNER_TEMP/runlib.sh"
+          printf '%s' "$VERDICT" > "$RUNNER_TEMP/verdict.mjs"
+      - name: Evidence runs and verdict
+        run: |
+          source "$RUNNER_TEMP/runlib.sh"
+          investigate out/suspect "$SUSPECT"
+          exit 0
+      - name: Upload investigation
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: shard2-investigate
+          path: out/
+          if-no-files-found: error
+
+  recover:
+    name: Shard 2/8 stage 1 recovery (two verified exceptions)
+    needs: investigate
+    runs-on: ubuntu-latest
+    timeout-minutes: 110
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.FIX_SHA }}
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: shard2-investigate
+          path: investigation
+      - name: Require a verified blocker before adding the exception
+        run: |
+          node -e '
+            const v = require("./investigation/suspect/verdict.json");
+            console.log(JSON.stringify({ file: v.file, blocker: v.blocker, runsAgree: v.runsAgree, expected: v.expected.length, literalTitles: v.literalTitles }));
+            if (!v.blocker) { console.error("not a verified blocker: no exception is added and Shard 2 is not rerun"); process.exit(1); }'
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.CI_NODE_MAJOR }}
+          package-manager-cache: false
+      - uses: ./.github/actions/npm-ci-retry
+        with:
+          cache: "false"
+      - name: Gate 0 - toolchain and isolation
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$FIX_SHA"
+          test "${{ runner.environment }}" = "github-hosted"
+          node -v; npm -v
+          test "$(node -p 'process.versions.node.split(".")[0]')" = "$CI_NODE_MAJOR"
+          test "$(npm -v)" = "$(node -p "require('./config/ci/toolchain.json').npm")"
+          test -z "${DATA_DIR+x}" && test -z "${OMNIROUTE_ALLOW_DEFAULT_DATA_DIR+x}"
+          npm run check:node-runtime
+          mkdir -p out
+          { echo "node=$(node -v)"; echo "npm=$(npm -v)"; echo "sha=$(git rev-parse HEAD)"; echo "shard=$SHARD/8"; } > out/toolchain.txt
+      - name: Write helpers
+        run: |
+          printf '%s' "$HANDLES_PRELOAD" > "$RUNNER_TEMP/hangdiag-preload.mjs"
+          printf '%s' "$TAP_PARSER" > "$RUNNER_TEMP/tap.mjs"
+          printf '%s' "$JUNIT_PARSER" > "$RUNNER_TEMP/junit.mjs"
+          printf '%s' "$RUN_LIB" > "$RUNNER_TEMP/runlib.sh"
+          printf '%s' "$VERDICT" > "$RUNNER_TEMP/verdict.mjs"
+          node -e '
+            const v = require("./investigation/suspect/verdict.json");
+            const exp = { [process.env.PRIOR_EXCEPTION]: JSON.parse(process.env.PRIOR_EXPECTED), [v.file]: v.expected };
+            require("fs").writeFileSync("out/exceptions.expected.json", JSON.stringify(exp, null, 1));
+            console.log(Object.entries(exp).map(([f, e]) => `${f}: ${e.length} expected`).join("\n"));'
+      - name: Select Shard 2 files and build the commands
+        run: |
+          set -euo pipefail
+          node -e 'require("fs").writeFileSync("out/stage1.original.cmd", require("./package.json").scripts["test:unit:ci:shard"].split(" && ")[0])'
+          node - <<'EOF'
+          const fs = require("fs");
+          const cmd = fs.readFileSync("out/stage1.original.cmd", "utf8");
+          for (const what of [" --test-force-exit", " --test-shard=$TEST_SHARD "]) { const n = cmd.split(what).length - 1; if (n !== 1) { console.error(`expected exactly one ${JSON.stringify(what)}, found ${n}`); process.exit(1); } }
+          const [prefix, args] = cmd.split(" --test-shard=$TEST_SHARD ");
+          fs.writeFileSync("out/stage1.prefix", prefix);
+          fs.writeFileSync("out/stage1.args", args);
+          EOF
+          bash -c "printf '%s\n' $(cat out/stage1.args)" > out/stage1.expanded-args.txt
+          node --input-type=module - <<'EOF'
+          import { globSync, readFileSync, writeFileSync } from "node:fs";
+          const args = readFileSync("out/stage1.expanded-args.txt", "utf8").split("\n").filter(Boolean);
+          const files = [];
+          for (const a of args) {
+            if (/[*?{}[\]]/.test(a)) files.push(...globSync(a, { cwd: process.cwd(), exclude: (name) => name === "node_modules" }));
+            else files.push(a);
+          }
+          files.sort(); // node's createTestFileList: internal glob, exclude node_modules, sort
+          const shard = Number(process.env.SHARD);
+          const mine = files.filter((_, i) => i % 8 === shard - 1); // --test-shard index filter
+          const exceptions = Object.keys(JSON.parse(readFileSync("out/exceptions.expected.json", "utf8")));
+          for (const e of exceptions) if (!mine.includes(e)) { console.error(`exception ${e} is not in shard ${shard}`); process.exit(1); }
+          const unsafe = mine.filter((f) => /[*?{}[\]'"\\]/.test(f));
+          if (unsafe.length) { console.error("file names unsafe as literal patterns: " + unsafe.join(", ")); process.exit(1); }
+          const main = mine.filter((f) => !exceptions.includes(f));
+          writeFileSync("out/shard.lst", mine.join("\n") + "\n");
+          writeFileSync("out/main.lst", main.join("\n") + "\n");
+          console.log(`discovered ${files.length} files; shard ${shard}: ${mine.length}; main run ${main.length}; exceptions ${exceptions.join(", ")}`);
+          const prefix = readFileSync("out/stage1.prefix", "utf8");
+          const mainCmd = prefix.replace(" --test-force-exit", " --test-reporter=spec --test-reporter-destination=stdout --test-reporter=junit --test-reporter-destination=out/main.junit.xml");
+          if (mainCmd.includes("--test-force-exit") || mainCmd === prefix) process.exit(1);
+          writeFileSync("out/main.cmd", mainCmd + " " + main.map((f) => `'${f}'`).join(" "));
+          const exc = prefix.replace(" --test ", " --test --test-reporter=tap --test-reporter-destination=stdout ");
+          if (exc === prefix || !exc.includes("--test-force-exit")) process.exit(1);
+          exceptions.forEach((e, i) => writeFileSync(`out/exception-${i + 1}.cmd`, exc + ` '${e}'`));
+          writeFileSync("out/exceptions.lst", exceptions.join("\n") + "\n");
+          EOF
+          echo "main:       $(cut -c1-260 out/main.cmd) …"
+          for f in out/exception-*.cmd; do echo "$(basename $f): $(cat $f)"; done
+      - name: Main run - all Shard 2 files except the two exceptions, no force-exit (bounded)
+        run: |
+          set +e
+          start=$(date +%s)
+          PATH="$PWD/node_modules/.bin:$PATH" timeout -k 30 2700 bash -c "$(cat out/main.cmd)" > out/main.log 2>&1 < /dev/null
+          rc=$?
+          printf 'main\t%s\t%s\n' "$rc" "$(( $(date +%s) - start ))" | tee out/main.rc.tsv
+          grep -aE '^ℹ (tests|suites|pass|fail|cancelled|skipped|todo|duration_ms) ' out/main.log | tail -8 > out/main.summary
+          cat out/main.summary
+          awk '/failing tests:/{f=1} f' out/main.log | grep -avE '^\s+at ' | head -200
+          exit 0
+      - name: Named exceptions - each alone with the original flags, verified per test
+        run: |
+          set +e
+          n=0
+          while read -r f; do
+            n=$((n + 1))
+            for i in 1 2 3 4 5; do
+              start=$(date +%s)
+              PATH="$PWD/node_modules/.bin:$PATH" timeout -k 15 300 bash -c "$(cat out/exception-$n.cmd)" > "out/exception-$n-$i.tap" 2> "out/exception-$n-$i.err" < /dev/null
+              rc=$?
+              printf '%s\t%s\t%s\t%s\n' "$f" "$i" "$rc" "$(( $(date +%s) - start ))" | tee -a out/exception.rc.tsv
+              F="$f" N="$n" I="$i" node --input-type=module -e "
+                const { parseTap } = await import('$RUNNER_TEMP/tap.mjs');
+                const { readFileSync } = await import('node:fs');
+                const exp = JSON.parse(readFileSync('out/exceptions.expected.json', 'utf8'))[process.env.F];
+                const got = parseTap('out/exception-' + process.env.N + '-' + process.env.I + '.tap');
+                const same = got.summary && got.tests.length === exp.length && exp.every((e, k) => got.tests[k]?.id === e.id && got.tests[k]?.status === e.status);
+                console.log(process.env.F + ' attempt ' + process.env.I + ': reported ' + got.tests.length + '/' + exp.length + ', exact identity+status match: ' + !!same);
+                process.exit(same ? 0 : 1);" && { printf '%s\t%s\n' "$f" "$i" >> out/exception.accepted.tsv; break; }
+            done
+          done < out/exceptions.lst
+          cat out/exception.accepted.tsv 2>/dev/null
+          exit 0
+      - name: If the main run did not terminate, diagnose the head-of-line file (no exception added)
+        run: |
+          set +e
+          rc=$(cut -f2 out/main.rc.tsv)
+          if [ "$rc" != 124 ] && [ "$rc" != 137 ]; then echo "main run terminated (rc=$rc); nothing to diagnose"; exit 0; fi
+          next=$(awk '/^Interrupted while running:/{f=1; next} f && /^⚠ tests\/unit\//{sub(/^⚠ /,""); sub(/ \(.*/,""); print; exit}' out/main.log)
+          echo "head-of-line file at interruption: ${next:-<none reported>}"
+          echo "$next" > out/next-blocker.txt
+          [ -n "$next" ] || exit 0
+          source "$RUNNER_TEMP/runlib.sh"
+          investigate out/next-blocker "$next"
+          exit 0
+      - name: Shard 2 results and consistency checks
+        run: |
+          node --input-type=module - <<'EOF'
+          import { readFileSync, writeFileSync, existsSync } from "node:fs";
+          const { parseJunit } = await import(`${process.env.RUNNER_TEMP}/junit.mjs`);
+          const { parseTap } = await import(`${process.env.RUNNER_TEMP}/tap.mjs`);
+          const [, rc, secs] = readFileSync("out/main.rc.tsv", "utf8").trim().split("\t");
+          const summary = {};
+          for (const l of readFileSync("out/main.summary", "utf8").split("\n")) { const m = l.match(/^ℹ (\w+) ([\d.]+)$/); if (m) summary[m[1]] = Number(m[2]); }
+          const problems = [];
+          if (rc === "124" || rc === "137") problems.push("main run TIMEOUT (did not terminate within its limit)");
+          if (!("tests" in summary)) problems.push("main run: missing runner summary");
+          let tests = [], jsuites = 0;
+          if (!existsSync("out/main.junit.xml")) problems.push("main run: missing JUnit file");
+          else { try { ({ tests, suites: jsuites } = parseJunit("out/main.junit.xml", process.cwd() + "/")); } catch (e) { problems.push("main run: malformed JUnit: " + e.message); } }
+          const c = (s) => tests.filter((t) => t.status === s).length;
+          let parentTests = null;
+          if ("tests" in summary) {
+            parentTests = jsuites - summary.suites;
+            const gaps = { pass: summary.pass - c("pass"), fail: summary.fail - c("fail") - c("timeout"), cancelled: summary.cancelled - c("cancelled"), skipped: summary.skipped - c("skip"), todo: summary.todo - c("todo") };
+            const gapSum = Object.values(gaps).reduce((a, b) => a + b, 0);
+            if (parentTests < 0 || tests.length + parentTests !== summary.tests) problems.push(`main run: JUnit testcases ${tests.length} + parent tests ${parentTests} != summary tests ${summary.tests}`);
+            if (Object.values(gaps).some((g) => g < 0) || gapSum !== parentTests) problems.push(`main run: per-status JUnit/summary mismatch ${JSON.stringify(gaps)} vs parent tests ${parentTests}`);
+          }
+          if (tests.some((t) => !t.file)) problems.push(`main run: ${tests.filter((t) => !t.file).length} testcases without a file attribute`);
+          const keys = new Map();
+          for (const t of tests) { const k = `${t.file} :: ${t.id}`; keys.set(k, (keys.get(k) ?? 0) + 1); }
+          const duplicates = [...keys].filter(([, n]) => n > 1).map(([key, count]) => ({ key, count }));
+          const exceptions = readFileSync("out/exceptions.lst", "utf8").trim().split("\n");
+          const accepted = existsSync("out/exception.accepted.tsv") ? Object.fromEntries(readFileSync("out/exception.accepted.tsv", "utf8").trim().split("\n").map((l) => l.split("\t"))) : {};
+          const exceptionTests = [];
+          exceptions.forEach((f, k) => {
+            if (!accepted[f]) { problems.push(`exception ${f}: no attempt reported exactly the expected identities and statuses`); return; }
+            for (const t of parseTap(`out/exception-${k + 1}-${accepted[f]}.tap`).tests) exceptionTests.push({ file: f, id: t.id, status: t.status, err: t.err });
+          });
+          const nextBlocker = existsSync("out/next-blocker.txt") ? readFileSync("out/next-blocker.txt", "utf8").trim() : null;
+          const out = { shard: 2, exceptions, main: { rc: Number(rc), secs: Number(secs), summary, junitSuites: jsuites, parentTests, duplicates, tests }, exceptionAccepted: accepted, exceptionTests, nextBlocker, problems };
+          writeFileSync("out/shard2.results.json", JSON.stringify(out));
+          const nonpass = [...tests, ...exceptionTests].filter((t) => !["pass", "skip", "todo"].includes(t.status));
+          console.log(`shard 2: main rc=${rc} ${JSON.stringify(summary)} junit=${tests.length} parentTests=${parentTests} files=${new Set(tests.map((t) => t.file)).size} duplicates=${duplicates.length}; exceptions accepted ${JSON.stringify(accepted)}; next blocker ${nextBlocker}; problems=${JSON.stringify(problems)}`);
+          for (const t of nonpass) console.log(`  NON-PASS ${t.status} ${t.file} :: ${t.id} | ${t.err}`);
+          process.exit(problems.length ? 1 : 0);
+          EOF
+      - name: Upload Shard 2 results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: shard2-recover
+          path: |
+            out/
+            investigation/
+          if-no-files-found: error
