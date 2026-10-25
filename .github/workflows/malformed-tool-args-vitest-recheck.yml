@@ -6,9 +6,12 @@
 # Lives only on test/malformed-tool-args-linux-20261025.
 name: Malformed Tool Args Vitest UI Recheck
 
+# Parked after run 40215050414 (workflow_dispatch only; not on the default branch, so it cannot
+# start). Restore the push trigger below to re-run this recheck.
+#   push:
+#     branches: [test/malformed-tool-args-linux-20261025]
 on:
-  push:
-    branches: [test/malformed-tool-args-linux-20261025]
+  workflow_dispatch:
 
 concurrency:
   group: malformed-tool-args-vitest-recheck-${{ github.ref }}

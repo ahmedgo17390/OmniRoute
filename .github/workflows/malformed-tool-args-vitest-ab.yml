@@ -1,0 +1,125 @@
+# TEMPORARY same-runner A/B of the full Vitest UI suite, candidate vs untouched base.
+# Runs 40211951530 and 40215050414 showed full-suite UI failures (10-12 tests, mostly 5000 ms
+# timeouts) on every run slower than ~300 s, on both sides, while every run under ~250 s passed
+# and the three affected files passed 5/5 in isolation on both sides. Separate runners mix
+# machine speed into the comparison, so here each job runs BOTH sides back to back on the same
+# runner (in both orders across the two jobs) with the same node_modules.
+# Lives only on test/malformed-tool-args-linux-20261025.
+name: Malformed Tool Args Vitest UI A/B
+
+on:
+  push:
+    branches: [test/malformed-tool-args-linux-20261025]
+
+concurrency:
+  group: malformed-tool-args-vitest-ab-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CAND_SHA: 13fb425e90ba4022a21f6cf71170ecbab6336d6f
+  BASE_SHA: 81e48878b90fb309ede580bca8b97c6953a2fc62
+  CI_NODE_MAJOR: "24"
+  NEXT_TELEMETRY_DISABLED: "1"
+  OMNIROUTE_SKIP_SYSTEM_TRUST: "1"
+  JWT_SECRET: ci-test-secret-with-sufficient-length-for-validation
+  API_KEY_SECRET: ci-test-api-key-secret-long
+
+jobs:
+  ab:
+    name: Vitest UI same-runner A/B (${{ matrix.order }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        order: [candidate-first, base-first]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.CAND_SHA }}
+          fetch-depth: 3
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: ci-temp
+          sparse-checkout: .github/ci-temp
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.CI_NODE_MAJOR }}
+          package-manager-cache: false
+      - uses: ./.github/actions/npm-ci-retry
+        with:
+          cache: "false"
+      - name: Gate 0 and the base tree on the same runner
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$CAND_SHA"
+          test "$(git rev-parse HEAD~2)" = "$BASE_SHA"
+          test "${{ runner.environment }}" = "github-hosted"
+          test "$(node -p 'process.versions.node.split(".")[0]')" = "$CI_NODE_MAJOR"
+          test "$(npm -v)" = "$(node -p "require('./config/ci/toolchain.json').npm")"
+          test -z "${DATA_DIR+x}" && test -z "${OMNIROUTE_ALLOW_DEFAULT_DATA_DIR+x}"
+          # The fix changes no dependency: one install serves both trees.
+          git diff --quiet "$BASE_SHA" HEAD -- package.json package-lock.json packages
+          git worktree add --detach "$RUNNER_TEMP/base" "$BASE_SHA"
+          cp -a node_modules "$RUNNER_TEMP/base/node_modules"
+          test "$(git -C "$RUNNER_TEMP/base" rev-parse HEAD)" = "$BASE_SHA"
+          echo "BASE_DIR=$RUNNER_TEMP/base" >> "$GITHUB_ENV"
+          mkdir -p out
+          { echo "nproc=$(nproc)"; echo "order=${{ matrix.order }}"; } > out/runner.txt
+      - name: Full Vitest UI on both trees, back to back (bounded)
+        run: |
+          set +e
+          if [ "${{ matrix.order }}" = candidate-first ]; then order="candidate base"; else order="base candidate"; fi
+          for side in $order; do
+            dir=$([ "$side" = candidate ] && echo "$GITHUB_WORKSPACE" || echo "$BASE_DIR")
+            mkdir -p "$dir/out"
+            start=$(date +%s)
+            (cd "$dir" && timeout -k 30 1500 npx --no-install vitest run --config vitest.config.ts \
+              --reporter=default --reporter=junit --outputFile.junit=out/vitest.junit.xml > out/vitest.log 2>&1 < /dev/null)
+            rc=$?
+            secs=$(( $(date +%s) - start ))
+            printf '%s\t%s\t%s\n' "$side" "$rc" "$secs" | tee -a "$GITHUB_WORKSPACE/out/ab.tsv"
+            (cd "$dir" && SIDE=$side SUITE=ui-ab node "$GITHUB_WORKSPACE/ci-temp/.github/ci-temp/vitest-results.mjs" "$GITHUB_WORKSPACE/ci-temp/.github/ci-temp/lib" "$rc")
+            mkdir -p "$GITHUB_WORKSPACE/out/$side"
+            cp "$dir/out/vitest.json" "$dir/out/vitest.junit.xml" "$GITHUB_WORKSPACE/out/$side/"
+            tail -6 "$dir/out/vitest.log" > "$GITHUB_WORKSPACE/out/$side/vitest.tail.txt"
+          done
+          exit 0
+      - name: Same-runner comparison
+        run: |
+          node --input-type=module - <<'EOF'
+          import { readFileSync, writeFileSync, appendFileSync } from "node:fs";
+          const BAD = new Set(["fail", "timeout", "cancelled"]);
+          const rows = readFileSync("out/ab.tsv", "utf8").trim().split("\n").map((l) => l.split("\t"));
+          const r = Object.fromEntries(["candidate", "base"].map((s) => [s, JSON.parse(readFileSync(`out/${s}/vitest.json`, "utf8"))]));
+          const ids = (s) => new Set(r[s].tests.filter((t) => BAD.has(t.status)).map((t) => `${t.file} :: ${t.id}`));
+          const c = ids("candidate"), b = ids("base");
+          const same = r.candidate.tests.length === r.base.tests.length;
+          const md = [
+            `## Same-runner A/B (${process.env.ORDER}) — ${readFileSync("out/runner.txt", "utf8").trim().replace(/\n/g, ", ")}`, "",
+            "| side (run order) | rc | time | records | fail |", "|---|---|---|---|---|",
+            ...rows.map(([s, rc, secs]) => `| ${s} | ${rc} | ${secs}s | ${r[s].tests.length} | ${ids(s).size} |`), "",
+            `- identical record count: ${same}`,
+            `- failing on both: ${[...c].filter((k) => b.has(k)).length}`,
+            `- candidate only (${[...c].filter((k) => !b.has(k)).length}):`, ...[...c].filter((k) => !b.has(k)).map((k) => `  - ${k}`),
+            `- base only (${[...b].filter((k) => !c.has(k)).length}):`, ...[...b].filter((k) => !c.has(k)).map((k) => `  - ${k}`),
+            `- problems: ${JSON.stringify([...r.candidate.problems, ...r.base.problems])}`,
+          ].join("\n");
+          writeFileSync("out/ab-summary.md", md);
+          appendFileSync(process.env.GITHUB_STEP_SUMMARY, md + "\n");
+          console.log(md);
+          EOF
+        env:
+          ORDER: ${{ matrix.order }}
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ab-${{ matrix.order }}
+          path: out/
+          if-no-files-found: error
