@@ -1,0 +1,138 @@
+name: Fumadocs Prewatch Hardened Windows Validation
+
+on:
+  push:
+    branches: [test/fumadocs-prewatch-hardened-windows-20261027]
+  workflow_dispatch:
+
+concurrency:
+  group: fumadocs-prewatch-hardened-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Patch lifecycle and native Windows tests
+    runs-on: windows-latest
+    timeout-minutes: 20
+    env:
+      DISABLE_SQLITE_AUTO_BACKUP: "true"
+      NEXT_TELEMETRY_DISABLED: "1"
+      OMNIROUTE_SKIP_SYSTEM_TRUST: "1"
+      npm_config_legacy_peer_deps: "true"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Initialize isolated runner paths
+        shell: pwsh
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP "omniroute-fumadocs-prewatch-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          $privateHome = Join-Path $root "home"
+          $data = Join-Path $root "data"
+          $cache = Join-Path $root "npm-cache"
+          $privateTemp = Join-Path $root "tmp"
+          $npmrc = Join-Path $root "npmrc"
+
+          foreach ($directory in @($privateHome, $data, $cache, $privateTemp)) {
+            New-Item -ItemType Directory -Force -Path $directory | Out-Null
+          }
+
+          @(
+            "HOME=$privateHome"
+            "USERPROFILE=$privateHome"
+            "DATA_DIR=$data"
+            "TMP=$privateTemp"
+            "TEMP=$privateTemp"
+            "npm_config_cache=$cache"
+            "npm_config_userconfig=$npmrc"
+          ) | Add-Content -LiteralPath $env:GITHUB_ENV -Encoding utf8
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 24.22.1
+          package-manager-cache: false
+      - name: Verify Node.js version
+        shell: pwsh
+        run: |
+          if ((node --version) -ne "v24.22.1") {
+            throw "Expected Node.js v24.22.1."
+          }
+      - name: Clean npm ci with lifecycle scripts
+        shell: pwsh
+        run: npm ci --no-audit --no-fund
+      - name: Verify Fumadocs patch markers
+        shell: pwsh
+        run: |
+          $packageVersion = node -p "require('./node_modules/fumadocs-mdx/package.json').version"
+          if ($packageVersion -ne "15.4.6") {
+            throw "Expected fumadocs-mdx 15.4.6; found $packageVersion."
+          }
+
+          $source = Get-Content "node_modules/fumadocs-mdx/dist/next/index.js" -Raw
+          $types = Get-Content "node_modules/fumadocs-mdx/dist/next/index.d.ts" -Raw
+          $sourceMarkers = @(
+            "function toArray(value) {",
+            "init(isDev, core, options.watcher)",
+            "function init(dev, core, watcherOptions) {",
+            "ignored: [core.outDir, ...toArray(watcherOptions?.ignored)]"
+          )
+          $typeMarkers = @(
+            'import type { ChokidarOptions } from "chokidar";',
+            "watcher?: Pick<ChokidarOptions, 'ignored'>;"
+          )
+
+          foreach ($marker in $sourceMarkers) {
+            if (-not $source.Contains($marker)) {
+              throw "Missing Fumadocs source marker: $marker"
+            }
+          }
+          foreach ($marker in $typeMarkers) {
+            if (-not $types.Contains($marker)) {
+              throw "Missing Fumadocs type marker: $marker"
+            }
+          }
+      - name: Verify patch reapplication is idempotent
+        shell: pwsh
+        run: |
+          $output = & node scripts/build/apply-fumadocs-mdx-patch.mjs 2>&1
+          $exitCode = $LASTEXITCODE
+          $output | ForEach-Object { Write-Host $_ }
+          if ($exitCode -ne 0) {
+            throw "Patch reapplication failed with exit code $exitCode."
+          }
+          if (($output | Out-String) -notmatch "watcher patch is already applied") {
+            throw "Patch reapplication did not report the expected idempotent result."
+          }
+      - name: Run focused native Windows test
+        shell: pwsh
+        run: |
+          $output = & npm run test:fumadocs-prewatch 2>&1
+          $exitCode = $LASTEXITCODE
+          $output | ForEach-Object { Write-Host $_ }
+          if ($exitCode -ne 0) {
+            throw "Focused test failed with exit code $exitCode."
+          }
+
+          $summaryLines = ($output | Out-String) -split "\r?\n"
+          $expectedCounts = [ordered]@{
+            tests = 17
+            pass = 17
+            fail = 0
+            skipped = 0
+          }
+
+          foreach ($fieldName in $expectedCounts.Keys) {
+            $fieldPattern = "^\s*(?:#|ℹ)\s*$fieldName\s+(\d+)\s*$"
+            $fieldLines = @($summaryLines | Where-Object { $_ -match $fieldPattern })
+            if ($fieldLines.Count -ne 1) {
+              throw "Focused test must report exactly one '$fieldName' summary line."
+            }
+
+            $null = $fieldLines[0] -match $fieldPattern
+            $actualCount = [int]$Matches[1]
+            if ($actualCount -ne $expectedCounts[$fieldName]) {
+              throw "Focused test reported $fieldName=$actualCount; expected $($expectedCounts[$fieldName])."
+            }
+          }
