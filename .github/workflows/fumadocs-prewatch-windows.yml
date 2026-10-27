@@ -1,4 +1,4 @@
-name: Fumadocs Prewatch Hardened Windows Validation
+name: Fumadocs Prewatch Windows Validation
 
 on:
   push:
