@@ -1,46 +1,66 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import test from "node:test";
 
+import { macosDevExperimentalOverrides } from "../../scripts/build/macosDevWorkaround.mjs";
+
+// The darwin/development predicate is tested as a pure helper instead of importing the whole
+// next.config.mjs: with NODE_ENV=development that import starts the fumadocs-mdx dev watcher,
+// which keeps the event loop alive and hangs a plain `node --test` run (#17955).
+
 const require = createRequire(import.meta.url);
-test("macOS development loads TypeScript configuration without spawning the CLI", async () => {
-  const previousNodeEnv = process.env.NODE_ENV;
-  process.env.NODE_ENV = "development";
-  try {
-    const { default: config } = await import("../../next.config.mjs");
-    if (process.platform === "darwin") {
-      assert.equal(config.experimental.useTypeScriptCli, false);
-      assert.equal(config.experimental.workerThreads, true);
-      const loadJsConfig = require("next/dist/build/load-jsconfig.js").default;
-      const result = await loadJsConfig(process.cwd(), config);
-      assert.deepEqual(result.jsConfig.compilerOptions.paths["@/*"], ["./src/*"]);
-    } else {
-      assert.equal(config.experimental.useTypeScriptCli, undefined);
-      assert.equal(config.experimental.workerThreads, undefined);
-    }
-  } finally {
-    if (previousNodeEnv === undefined) delete process.env.NODE_ENV;
-    else process.env.NODE_ENV = previousNodeEnv;
+
+test("macOS development disables the TypeScript CLI and enables worker threads", () => {
+  assert.deepEqual(macosDevExperimentalOverrides({ platform: "darwin", nodeEnv: "development" }), {
+    useTypeScriptCli: false,
+    workerThreads: true,
+  });
+});
+
+test("worker thread workaround is limited to macOS development", () => {
+  for (const [platform, nodeEnv] of [
+    ["darwin", "production"],
+    ["darwin", "test"],
+    ["darwin", undefined],
+    ["linux", "development"],
+    ["win32", "development"],
+    ["linux", "production"],
+  ]) {
+    assert.deepEqual(
+      macosDevExperimentalOverrides({ platform, nodeEnv }),
+      {},
+      `${platform}/${nodeEnv} must keep the Next defaults`
+    );
   }
 });
 
-test("worker thread workaround is limited to macOS development", async () => {
-  const previousNodeEnv = process.env.NODE_ENV;
-  const platform = Object.getOwnPropertyDescriptor(process, "platform");
-  try {
-    for (const [os, nodeEnv, expected] of [
-      ["darwin", "development", true],
-      ["darwin", "production", undefined],
-      ["linux", "development", undefined],
-    ]) {
-      Object.defineProperty(process, "platform", { value: os, configurable: true });
-      process.env.NODE_ENV = nodeEnv;
-      const { default: config } = await import(`../../next.config.mjs?test=${os}-${nodeEnv}`);
-      assert.equal(config.experimental.workerThreads, expected);
-    }
-  } finally {
-    Object.defineProperty(process, "platform", platform);
-    if (previousNodeEnv === undefined) delete process.env.NODE_ENV;
-    else process.env.NODE_ENV = previousNodeEnv;
-  }
+test("defaults read the current process platform and NODE_ENV", () => {
+  const expected =
+    process.platform === "darwin" && process.env.NODE_ENV === "development"
+      ? { useTypeScriptCli: false, workerThreads: true }
+      : {};
+  assert.deepEqual(macosDevExperimentalOverrides(), expected);
+});
+
+test("in-process TypeScript config loading still resolves the @/* path alias", async () => {
+  const experimental = macosDevExperimentalOverrides({
+    platform: "darwin",
+    nodeEnv: "development",
+  });
+  const loadJsConfig = require("next/dist/build/load-jsconfig.js").default;
+  const result = await loadJsConfig(process.cwd(), { experimental, typescript: {} });
+  assert.deepEqual(result.jsConfig.compilerOptions.paths["@/*"], ["./src/*"]);
+});
+
+test("next.config.mjs spreads the macOS dev overrides into experimental", () => {
+  const source = readFileSync(new URL("../../next.config.mjs", import.meta.url), "utf8");
+  assert.match(
+    source,
+    /import \{ macosDevExperimentalOverrides \} from "\.\/scripts\/build\/macosDevWorkaround\.mjs";/
+  );
+  assert.match(
+    source,
+    /experimental: \{\s*(?:\/\/[^\n]*\n\s*)*\.\.\.macosDevExperimentalOverrides\(\),/
+  );
 });

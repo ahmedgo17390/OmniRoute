@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { betterSqlite3AliasFor } from "./scripts/build/better-sqlite3-stub-flag.mjs";
 import { mitmManagerAliasFor } from "./scripts/build/mitm-stub-flag.mjs";
 import { normalizeBasePath } from "./scripts/build/normalizeBasePath.mjs";
+import { macosDevExperimentalOverrides } from "./scripts/build/macosDevWorkaround.mjs";
 import {
   buildSecurityHeaderRules,
   nonPageRoutePrefixes,
@@ -200,14 +201,9 @@ const nextConfig = {
   // accept for image-bearing requests; tune via env if a deployment needs
   // more.
   experimental: {
-    // Next's TypeScript CLI subprocess can fail with EBADF during macOS dev
-    // startup. TypeScript 6 provides the API Next uses to read the same config
-    // in-process; leave the default unchanged for production and other platforms.
-    // Next's development static-path worker can hit the same spawn failure.
-    // Use its experimental thread worker on macOS development only.
-    ...(process.platform === "darwin" && process.env.NODE_ENV === "development"
-      ? { useTypeScriptCli: false, workerThreads: true }
-      : {}),
+    // macOS development only: avoid the EBADF spawn failures of Next's TypeScript
+    // CLI and static-path worker (see scripts/build/macosDevWorkaround.mjs).
+    ...macosDevExperimentalOverrides(),
     serverActions: {
       bodySizeLimit: process.env.OMNIROUTE_SERVER_ACTIONS_BODY_LIMIT || "50mb",
     },
